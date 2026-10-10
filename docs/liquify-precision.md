@@ -23,6 +23,36 @@ length. Face shape covers width, forehead, jawline, and chin length. Zero means
 the detected starting shape. Sliders rebuild one model-independent face operation
 from that starting shape, so repeated previews do not accumulate deformation.
 
+Hover over an eye, the mouth, nose, or face outline to reveal its on-image
+handles. Small arrows show the drag direction; hovering a handle names the edit.
+Eye handles adjust size, height and width, respecting the panel's linked-eye setting.
+Mouth corners change smile and width; the top and bottom handles move the lip
+outlines. Nose and face-outline handles change nose width/length and face
+width, chin, forehead and jaw. Handles keep their screen size while zooming.
+Hand, Zoom, Space/middle-button panning, and Original view retain navigation
+priority. Select the face icon to return from Hand/Zoom to dragging face handles.
+A drag changes the same absolute slider values, without brush strokes.
+
+**Head rotation (2.5D)** provides **Turn left / right** and **Look down / up** in
+degrees. Try 5–15° first; the combined yaw/pitch magnitude is capped at 30°.
+Hover over the face outline and use **Turn head** above the forehead to drag
+sideways and up/down. Reset face also resets rotation. Older saved face edits
+without depth still work; Detect again enables rotation for them.
+
+The detector's inferred Z coordinates are scaled by thumbnail width, following
+[MediaPipe's weak-perspective coordinate specification](https://github.com/google-ai-edge/mediapipe/blob/master/docs/solutions/face_mesh.md#face-transform-module).
+An original 25×25 depth surface drives orthographic rotation around a virtual
+head pivot. Nose and cheek depths produce different movement. The image's inverse
+map is solved on a 257×257 lattice, with positive-Jacobian and convergence checks,
+then composed with the feature warp and freeze mask. A smooth outer transition
+anchors the surrounding image. Depth and sliders are saved with the edit, so
+replay does not need the detector. This is approximate relative rotation from
+the current photograph, not a calibrated 3D reconstruction: it cannot reveal
+occluded skin, hair, ears, or the far side of the nose. If an angle would fold the
+face, the edit is rejected and the last accepted preview stays visible. The 30°
+cap is a ceiling, not a promise that every face can turn that far; the acceptance
+portrait supports ±15° and exercises safe rejection at unstable larger turns.
+
 **Edited photo / Original photo** compares the result. **Reset face** restores
 the current face adjustment; **Apply** commits the session and **Cancel** discards
 it. Turning face controls off keeps the existing edit and restores access to
@@ -62,8 +92,19 @@ directly; Cargo is only needed when changing the source. Rebuild it with:
 ./scripts/build-windows-personal.ps1
 ```
 
-The script builds the native Windows app with two jobs, line-table debug symbols,
-and incremental compilation disabled, then copies the executable and any runtime
+For the optimized personal Windows build used for this delivery, add `-Release`:
+
+```powershell
+./scripts/build-windows-personal.ps1 -Release
+```
+
+Both choices build only the Windows host app. Release compilation takes longer;
+the resulting app uses optimized code. Neither choice creates installers or
+packages for other operating systems.
+
+The script builds the native Windows app with two jobs and incremental compilation
+disabled. Debug builds retain line-table symbols; `-Release` uses the optimized
+release profile. It copies the executable and any runtime
 DLLs into `dist/windows`, and installs the pinned MediaPipe model and Windows
 runtime. It does not build installers or release packages.
 After copying the app, the generated `target` directory can be removed when
@@ -85,6 +126,39 @@ compiler, test, lint, WASM, and build results in `summary.json` and gate logs.
 A native build alone does not establish that every check passed or that portrait
 editing behaves correctly. Interactive portrait QA and performance comparisons
 remain separate work.
+
+### Hover controls and depth turns: validation (2026-10-10)
+
+After merging 90 upstream commits through `3092d3b6`, the focused checks passed:
+**32 Liquify algorithm tests, 63 Liquify UI tests, 15 engine distortion tests,
+one ML input test, one real-detector portrait test, and the hostile-input
+command test**. Layers, formatting, all-target Clippy for algo/UI/engine/ML,
+and WebAssembly compatibility passed. These are focused checks, not a claim
+that every full-crate suite was run.
+
+The real portrait supports yaw and pitch at ±15°. Larger turns either produce
+an edit or return a fold/inversion error with the field, sliders, and history
+unchanged. Regressions cover parallax, fixed background, bounded angles,
+serialization/replay, freeze protection, direct mouse gestures, linked eyes,
+zoom-independent values, navigation priority, and non-overlapping forehead/turn
+handles. Visual review caught clipped angle values and overlapping handles;
+both were corrected.
+Selecting the face icon after Hand/Zoom returns to handle editing without a new
+detection; this is covered by a full-dialog mouse-input regression.
+
+The 24 MP release field benchmark measured **165.4 ms / 52.0 ms** for the
+existing feature edit with one/four workers, and **245.5 ms / 99.7 ms** with a
+15° depth turn added. Each uses 1,505,004 nodes; output is bit-identical between
+one and four workers. This excludes inference, display refinement, and upload.
+The broad `cargo xtask perf --quick` run also passed. Quick mode uses smaller
+documents and does not enforce the full-size budgets; the baseline was from a
+different machine class, so cross-machine regression comparison was skipped.
+Existing over-budget/unmeasured UI scenarios remain reported by the harness.
+That run preceded the final navigation-only correction, which passed the full
+63-test Liquify UI set, native portrait regression, all-target UI Clippy, and a
+separate UI WebAssembly check afterward. The final optimized Windows executable
+is **65.75 MiB**; its version check succeeds. The build helper's `-Release`
+option was exercised by that build.
 
 ### Automatic face controls: validation
 

@@ -13,7 +13,7 @@ fn liquify_face_sliders_commit_and_undo_at_every_depth_and_reject_invalid_payloa
         RigWarp::new(RegionKind::Mouth, [20., 10., 60., 50.]).unwrap(),
         RigWarp::new(RegionKind::Mouth, [0., 0., 80., 60.]).unwrap(),
     ];
-    let face = FaceWarp { regions, sliders: FaceSliders { eye_size: 40., smile: 30., ..Default::default() } };
+    let face = FaceWarp { regions, sliders: FaceSliders { eye_size: 40., smile: 30., ..Default::default() }, depth: None };
     let params = json!({"strokes":[{"tool":"faceWarpV1","face":face}]});
     for depth in [8, 16, 32] {
         let mut s = session(depth);
@@ -28,6 +28,18 @@ fn liquify_face_sliders_commit_and_undo_at_every_depth_and_reject_invalid_payloa
         assert_eq!(active_surface(&s), before);
         assert!(s.execute(LIQUIFY, json!({"strokes":[{"tool":"faceWarpV1"}]})).is_err());
         assert!(s.execute(LIQUIFY, json!({"strokes":[{"tool":"forwardWarp","face":face}]})).is_err());
+        let mut turned = face.clone();
+        turned.depth = Some(Box::new(photocraft_algo::liquify::face::pose::FaceDepth { bounds: [10., 5., 70., 55.], samples: [[-10.; 25]; 25] }));
+        turned.sliders.head_yaw = 15.;
+        let turned_params = json!({"strokes":[{"tool":"faceWarpV1","face":turned}]});
+        s.execute(LIQUIFY, turned_params.clone()).unwrap();
+        assert_ne!(active_surface(&s), before);
+        s.undo();
+        assert_eq!(active_surface(&s), before);
+        let mut invalid = turned_params;
+        invalid["strokes"][0]["face"]["sliders"]["headYaw"] = json!(31);
+        assert!(s.execute(LIQUIFY, invalid).is_err());
+        assert_eq!(active_surface(&s), before);
     }
 }
 

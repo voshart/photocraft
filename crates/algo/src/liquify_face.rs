@@ -8,12 +8,18 @@ use super::{
 use photocraft_geom::Rect;
 use serde::{Deserialize, Serialize};
 
+#[path = "liquify_face_pose.rs"]
+pub mod pose;
+
 /// Whole-face edits can span a 24?36 MP photo; bounded by the session field budget.
 const MAX_FACE_NODES: u64 = 4_000_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct FaceSliders {
+    /// Relative weak-perspective head turn, in degrees. Combined turn is capped at 30°.
+    pub head_yaw: f64,
+    pub head_pitch: f64,
     pub eye_size: f64,
     pub eye_width: f64,
     pub eye_height: f64,
@@ -41,6 +47,9 @@ pub struct FaceSliders {
 
 impl FaceSliders {
     pub fn validate(&self) -> Result<(), String> {
+        if !self.head_yaw.is_finite() || !self.head_pitch.is_finite() || self.head_yaw.hypot(self.head_pitch) > 30.0 + 1e-9 {
+            return Err("Head turn must be finite and within 30 degrees in total".into());
+        }
         let values = [
             self.eye_size,
             self.eye_width,
@@ -81,6 +90,9 @@ impl FaceSliders {
 pub struct FaceWarp {
     pub regions: [RigWarp; 5],
     pub sliders: FaceSliders,
+    /// Absent on older, 2D-only saved edits. A fixed-size depth surface bounds decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<Box<pose::FaceDepth>>,
 }
 
 fn region(kind: RegionKind, points: [[f64; 2]; 8]) -> Result<RigWarp, String> {
@@ -123,11 +135,33 @@ impl FaceWarp {
                 region(RegionKind::Mouth, contour([234, 67, 10, 297, 454, 365, 152, 136])?)?,
             ],
             sliders: FaceSliders::default(),
+            depth: None,
         })
+    }
+
+    pub fn from_depth_landmarks(points: &[[f64; 3]]) -> Result<Self, String> {
+        if points.len() != 478 {
+            return Err("Depth needs exactly 478 face landmarks".into());
+        }
+        let xy: Vec<_> = points.iter().map(|p| [p[0], p[1]]).collect();
+        let mut face = Self::from_landmarks(&xy)?;
+        face.depth = Some(Box::new(pose::FaceDepth::from_landmarks(points)?));
+        Ok(face)
+    }
+
+    /// Project a feature handle through the same depth rotation as the image.
+    pub fn project_point(&self, p: [f64; 2]) -> [f64; 2] {
+        self.depth.as_ref().map_or(p, |depth| depth.project(p, self.sliders.head_yaw, self.sliders.head_pitch))
     }
 
     pub fn adjusted(&self) -> Result<[RigWarp; 5], String> {
         self.sliders.validate()?;
+        if let Some(depth) = &self.depth {
+            depth.validate()?;
+        }
+        if (self.sliders.head_yaw != 0.0 || self.sliders.head_pitch != 0.0) && self.depth.is_none() {
+            return Err("Detect this face again to get depth for head rotation".into());
+        }
         for r in &self.regions {
             r.validate()?;
             if !r.is_identity() || r.pinned.iter().any(|v| *v) {
@@ -224,18 +258,23 @@ impl FaceWarp {
                 r.validate_grid_with_budget(bounds, cell, MAX_FACE_NODES)?;
             }
         }
+        if let Some(depth) = &self.depth {
+            depth.validate_grid(bounds, cell, MAX_FACE_NODES)?;
+            pose::PoseMap::prepare(depth, &self.sliders)?;
+        }
         Ok(())
     }
 
     /// Transactional: a rejected region never leaves a partially edited field.
     pub fn apply(&self, field: &mut LiquifyField) -> Result<Rect, String> {
         let regions = self.adjusted()?;
+        let rotation = self.depth.as_ref().map(|depth| pose::PoseMap::prepare(depth, &self.sliders)).transpose()?.flatten();
         for r in &regions {
             if !r.is_identity() {
                 r.validate_grid_with_budget(field.bounds, field.cell, MAX_FACE_NODES)?;
             }
         }
-        if regions.iter().all(RigWarp::is_identity) {
+        if regions.iter().all(RigWarp::is_identity) && rotation.is_none() {
             return Ok(Rect::EMPTY);
         }
         let mut candidate = field.clone();
@@ -244,6 +283,9 @@ impl FaceWarp {
             if !r.is_identity() {
                 dirty = dirty.union(&super::rig::apply_with_budget(&mut candidate, &r, MAX_FACE_NODES)?);
             }
+        }
+        if let Some(rotation) = rotation {
+            dirty = dirty.union(&rotation.apply(&mut candidate, MAX_FACE_NODES)?);
         }
         *field = candidate;
         Ok(dirty)
@@ -271,6 +313,7 @@ mod tests {
                 RigWarp::new(RegionKind::Mouth, [0.0, 0.0, 300.0, 300.0]).unwrap(),
             ],
             sliders: FaceSliders::default(),
+            depth: None,
         }
     }
     #[test]

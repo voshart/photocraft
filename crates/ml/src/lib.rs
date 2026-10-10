@@ -6,7 +6,7 @@
 /// Detect one face in a bounded, tightly packed sRGB inference thumbnail.
 /// Coordinates are normalized to this thumbnail. No image is sent over the network.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn face_landmarks(model: &std::path::Path, width: u32, height: u32, rgb: &[u8]) -> Result<Vec<Vec<[f64; 2]>>, String> {
+pub fn face_landmarks(model: &std::path::Path, width: u32, height: u32, rgb: &[u8]) -> Result<Vec<Vec<[f64; 3]>>, String> {
     use mediapipe::{FaceLandmarker, Image, ModelSource, Size};
     let count = u64::from(width).saturating_mul(u64::from(height));
     if width == 0 || height == 0 || count > 2_560_000 || count.saturating_mul(3) != rgb.len() as u64 {
@@ -21,8 +21,11 @@ pub fn face_landmarks(model: &std::path::Path, width: u32, height: u32, rgb: &[u
         .build()
         .map_err(|e| format!("MediaPipe could not start: {e}"))?;
     let result = detector.detect(&image).map_err(|e| format!("Face detection failed: {e}"))?;
-    let faces: Vec<_> =
-        result.landmarks.into_iter().map(|face| face.into_iter().map(|p| [f64::from(p.point.x()), f64::from(p.point.y())]).collect::<Vec<_>>()).collect();
+    let faces: Vec<_> = result
+        .landmarks
+        .into_iter()
+        .map(|face| face.into_iter().map(|p| [f64::from(p.point.x()), f64::from(p.point.y()), f64::from(p.point.z())]).collect::<Vec<_>>())
+        .collect();
     if faces.iter().any(|f| f.len() != 478 || f.iter().flatten().any(|v| !v.is_finite() || v.abs() > 2.0)) {
         return Err("MediaPipe returned invalid face landmarks".into());
     }

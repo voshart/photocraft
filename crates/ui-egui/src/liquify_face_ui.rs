@@ -7,8 +7,11 @@ use photocraft_algo::liquify::{
 };
 use serde_json::{Value, json};
 
+#[path = "liquify_face_handles_ui.rs"]
+pub(super) mod handles;
+
 #[cfg(not(target_arch = "wasm32"))]
-type DetectionResult = Result<Vec<Vec<[f64; 2]>>, String>;
+type DetectionResult = Result<Vec<Vec<[f64; 3]>>, String>;
 
 #[derive(Clone)]
 struct DetectedFace {
@@ -18,6 +21,7 @@ struct DetectedFace {
 
 #[derive(Default)]
 pub(super) struct FaceControls {
+    handles: handles::HandleState,
     pub(super) enabled: bool,
     faces: Vec<DetectedFace>,
     selected: usize,
@@ -33,6 +37,7 @@ pub(super) struct FaceControls {
 
 impl FaceControls {
     pub(super) fn photo_changed(&mut self) {
+        self.handles = Default::default();
         if !self.faces.is_empty() {
             self.faces.clear();
             self.sliders = FaceSliders::default();
@@ -80,9 +85,11 @@ fn model_path() -> Result<std::path::PathBuf, String> {
 pub(super) fn set_enabled(d: &mut LiquifyDialog, enabled: bool) -> Result<(), String> {
     d.end();
     d.face.enabled = enabled;
+    d.face.handles = Default::default();
     if !enabled {
         return Ok(());
     }
+    d.preview_tool = super::PreviewTool::Brush;
     d.rig.enabled = false;
     d.opts.view.before = false;
     if d.face.faces.is_empty() && !d.face.detecting() {
@@ -144,7 +151,7 @@ fn detect(d: &mut LiquifyDialog) -> Result<(), String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn accept_detection(d: &mut LiquifyDialog, faces: Vec<Vec<[f64; 2]>>) -> Result<(), String> {
+fn accept_detection(d: &mut LiquifyDialog, faces: Vec<Vec<[f64; 3]>>) -> Result<(), String> {
     if d.strokes.len() != d.face.base_len {
         return Err("The photo changed during detection. Click Detect faces again.".into());
     }
@@ -153,13 +160,19 @@ fn accept_detection(d: &mut LiquifyDialog, faces: Vec<Vec<[f64; 2]>>) -> Result<
         // Thumbnail width/height include a possible partial final proxy pixel.
         let points: Vec<_> = points
             .into_iter()
-            .map(|p| [f64::from(d.canvas.x0) + p[0] * d.proxy.w as f64 * d.proxy.scale, f64::from(d.canvas.y0) + p[1] * d.proxy.h as f64 * d.proxy.scale])
+            .map(|p| {
+                [
+                    f64::from(d.canvas.x0) + p[0] * d.proxy.w as f64 * d.proxy.scale,
+                    f64::from(d.canvas.y0) + p[1] * d.proxy.h as f64 * d.proxy.scale,
+                    p[2] * d.proxy.w as f64 * d.proxy.scale,
+                ]
+            })
             .collect();
-        if let Ok(warp) = FaceWarp::from_landmarks(&points).and_then(|warp| {
+        if let Ok(warp) = FaceWarp::from_depth_landmarks(&points).and_then(|warp| {
             warp.validate_grid(d.canvas, d.cell)?;
             Ok(warp)
         }) {
-            detected.push(DetectedFace { warp, points });
+            detected.push(DetectedFace { warp, points: points.into_iter().map(|p| [p[0], p[1]]).collect() });
         }
     }
     detected.sort_by(|a, b| {
@@ -172,7 +185,8 @@ fn accept_detection(d: &mut LiquifyDialog, faces: Vec<Vec<[f64; 2]>>) -> Result<
     d.face.faces = detected;
     d.face.selected = 0;
     d.face.sliders = FaceSliders::default();
-    d.face.status = "Face found. Move a slider to change the photo.".into();
+    d.face.handles = Default::default();
+    d.face.status = "Face found. Hover over a feature, then drag a handle or use a slider.".into();
     d.face.error = false;
     Ok(())
 }
@@ -249,6 +263,7 @@ fn apply_sliders(d: &mut LiquifyDialog, sliders: FaceSliders) -> Result<(), Stri
 
 /// Undo/redo and reopened Smart Filters recover saved sliders without running a model.
 pub(super) fn sync_history(d: &mut LiquifyDialog) {
+    d.face.handles = Default::default();
     if let Some(face) = d.strokes.last().and_then(|s| s.face.as_deref()) {
         let mut original = face.clone();
         original.sliders = FaceSliders::default();
@@ -353,7 +368,7 @@ pub(super) fn panel(d: &mut LiquifyDialog, ui: &mut egui::Ui) {
         ui.small("Turn on to find faces and adjust them with sliders.");
         return;
     }
-    ui.small("Move a slider, then Apply to save the result.");
+    ui.small("Hover over a face feature to reveal handles. Drag a handle or move a slider, then Apply.");
     let busy = d.face.detecting();
     if ui
         .add_enabled(
@@ -402,6 +417,33 @@ pub(super) fn panel(d: &mut LiquifyDialog, ui: &mut egui::Ui) {
             sliders = FaceSliders::default();
             changed = true;
         }
+        egui::CollapsingHeader::new("Head rotation (2.5D)").default_open(true).show(ui, |ui| {
+            ui.spacing_mut().slider_width = 100.0;
+            ui.small("Small turns work best: try 5–15°. Total turn is limited to 30°.");
+            let has_depth = d.face.faces.get(d.face.selected).is_some_and(|f| f.warp.depth.is_some());
+            if !has_depth {
+                ui.small("Detect again to enable depth rotation for this saved face.");
+            }
+            ui.add_enabled_ui(has_depth, |ui| {
+                let yaw_limit = (900.0 - sliders.head_pitch.powi(2)).max(0.0).sqrt();
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Turn left / right"));
+                    changed |= ui
+                        .add(egui::Slider::new(&mut sliders.head_yaw, -yaw_limit..=yaw_limit).suffix("°").step_by(0.5))
+                        .on_hover_text("Drag left or right to turn toward that side of the photo")
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Look down / up"));
+                    let pitch_limit = (900.0 - sliders.head_yaw.powi(2)).max(0.0).sqrt();
+                    changed |= ui
+                        .add(egui::Slider::new(&mut sliders.head_pitch, -pitch_limit..=pitch_limit).suffix("°").step_by(0.5))
+                        .on_hover_text("Negative looks down; positive looks up")
+                        .changed();
+                });
+            });
+            ui.small("Uses the existing photo: hidden skin, ears and hair cannot be reconstructed.");
+        });
         egui::CollapsingHeader::new("Eyes").default_open(true).show(ui, |ui| {
             let mut linked =
                 sliders.right_eye_size.is_none() && sliders.right_eye_width.is_none() && sliders.right_eye_height.is_none() && sliders.right_eye_tilt.is_none();
@@ -460,7 +502,7 @@ pub(super) fn draw(d: &LiquifyDialog, painter: &egui::Painter, area: egui::Rect)
     warp.sliders = d.face.sliders.clone();
     if let Ok(regions) = warp.adjusted() {
         for r in regions {
-            let mut line: Vec<_> = r.target.into_iter().map(|p| super::to_screen(d, area, p)).collect();
+            let mut line: Vec<_> = r.target.into_iter().map(|p| super::to_screen(d, area, warp.project_point(p))).collect();
             if let Some(first) = line.first().copied() {
                 line.push(first);
             }
@@ -478,13 +520,13 @@ pub(super) fn draw(d: &LiquifyDialog, painter: &egui::Painter, area: egui::Rect)
 mod tests {
     use super::*;
     use crate::PhotocraftApp;
-    fn app() -> PhotocraftApp {
+    pub(super) fn app() -> PhotocraftApp {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
         app.session.execute("file.new", json!({"width":300,"height":300})).unwrap();
         super::super::open(&mut app, &egui::Context::default()).unwrap();
         app
     }
-    fn ready(d: &mut LiquifyDialog) {
+    pub(super) fn ready(d: &mut LiquifyDialog) {
         use photocraft_algo::liquify::rig::{RegionKind, RigWarp};
         let regions = [
             RigWarp::new(RegionKind::Eye, [0., 20., 130., 130.]).unwrap(),
@@ -493,9 +535,39 @@ mod tests {
             RigWarp::new(RegionKind::Mouth, [80., 90., 220., 210.]).unwrap(),
             RigWarp::new(RegionKind::Mouth, [0., 0., 300., 300.]).unwrap(),
         ];
-        d.face.faces = vec![DetectedFace { warp: FaceWarp { regions, sliders: FaceSliders::default() }, points: Vec::new() }];
+        d.face.faces = vec![DetectedFace { warp: FaceWarp { regions, sliders: FaceSliders::default(), depth: None }, points: Vec::new() }];
         d.face.base_len = d.strokes.len();
         d.face.enabled = true;
+    }
+    #[test]
+    fn face_icon_returns_from_hand_and_zoom_without_redetecting_or_changing_pixels() {
+        let mut app = app();
+        ready(app.distort.liquify.as_mut().unwrap());
+        let ctx = egui::Context::default();
+        PhotocraftApp::setup_context(&ctx, Default::default());
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280., 900.));
+        let frame = |app: &mut PhotocraftApp, events| {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ui| super::super::show(app, ui.ctx()));
+            out.textures_delta.clear();
+        };
+        for _ in 0..4 {
+            frame(&mut app, vec![]);
+        }
+        let original = app.distort.liquify.as_ref().unwrap().field.clone();
+        let pos = egui::pos2(23., 539.);
+        for tool in [super::super::PreviewTool::Hand, super::super::PreviewTool::Zoom] {
+            app.distort.liquify.as_mut().unwrap().preview_tool = tool;
+            frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(&mut app, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }]);
+            }
+            let d = app.distort.liquify.as_ref().unwrap();
+            assert!(d.face.enabled);
+            assert!(!d.face.detecting());
+            assert!(d.preview_tool == super::super::PreviewTool::Brush);
+            assert_eq!(d.field, original);
+            assert!(d.strokes.is_empty());
+        }
     }
     #[test]
     fn face_slider_preview_is_absolute_resettable_and_one_undoable_operation() {
@@ -549,7 +621,9 @@ mod tests {
         assert_eq!(d.field, field);
         assert_eq!(d.strokes, strokes);
         assert!(control(d, &json!({"faceSliders":{"smile":30}})).is_err());
+        d.preview_tool = super::super::PreviewTool::Hand;
         control(d, &json!({"faceEnabled":true})).unwrap();
+        assert!(d.preview_tool == super::super::PreviewTool::Brush);
         assert!(!d.face.detecting());
         assert_eq!(d.field, field);
     }
@@ -577,6 +651,31 @@ mod tests {
         assert!(d.face.show_points, "Finishing detection must preserve the user's outline choice");
         assert_eq!(d.face.faces.first().unwrap().points.len(), 478);
         let original = d.field.clone();
+        assert!(d.face.faces.first().unwrap().warp.depth.is_some());
+        for key in ["headYaw", "headPitch"] {
+            for value in [-15, 15] {
+                control(d, &json!({"faceSliders":{key:value}})).unwrap_or_else(|e| panic!("{key}={value}: {e}"));
+                assert_ne!(d.field, original);
+                assert_eq!(d.strokes.len(), 1);
+            }
+            for value in [-30, 30] {
+                let before = d.field.clone();
+                let sliders = d.face.sliders.clone();
+                let strokes = d.strokes.clone();
+                match control(d, &json!({"faceSliders":{key:value}})) {
+                    Ok(()) => {
+                        assert_ne!(d.field, original);
+                        assert_eq!(d.strokes.len(), 1);
+                    }
+                    Err(e) => {
+                        assert!(e.contains("fold") || e.contains("inverted safely"), "{key}={value}: {e}");
+                        assert_eq!(d.field, before);
+                        assert_eq!(d.face.sliders, sliders);
+                        assert_eq!(d.strokes, strokes);
+                    }
+                }
+            }
+        }
         for key in [
             "eyeSize",
             "eyeWidth",

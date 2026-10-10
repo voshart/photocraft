@@ -947,8 +947,9 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             }
         }
         strip.add_space(10.0);
-        if crate::icons::button(&mut strip, "scan", 34.0, d.face.enabled, "Face adjustments: turn on automatic detection and sliders").clicked() {
-            let enabled = !d.face.enabled;
+        let face_editing = d.face.enabled && d.preview_tool == PreviewTool::Brush;
+        if crate::icons::button(&mut strip, "scan", 34.0, face_editing, "Face adjustments: turn on automatic detection and sliders").clicked() {
+            let enabled = !face_editing;
             let result = face_ui::set_enabled(d, enabled);
             d.face.feedback(result);
         }
@@ -1069,7 +1070,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         let resp = ui.interact(area, egui::Id::new("liquify-preview"), Sense::click_and_drag());
         // Handle wheel, Windows Ctrl+wheel, and pinch, preserving the point under the pointer.
-        if resp.hovered() && d.cur.is_none() && !d.rig.pointer_captured() {
+        if resp.hovered() && d.cur.is_none() && !d.rig.pointer_captured() && !face_ui::handles::captured(d) {
             let factor = preview_zoom_factor(ctx);
             if factor != 1.0
                 && let Some(hp) = resp.hover_pos()
@@ -1104,6 +1105,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             zoom_at(d, area, area.center(), 1.0 / d.pixels_per_point);
         }
         view_ui.label("Wheel: zoom | Space-drag: pan");
+        face_ui::handles::interact(d, ui, area, &resp);
         let img = ERect::from_min_max(
             to_screen(d, area, [f64::from(d.canvas.x0), f64::from(d.canvas.y0)]),
             to_screen(d, area, [f64::from(d.canvas.x1), f64::from(d.canvas.y1)]),
@@ -1123,7 +1125,15 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         {
             clip.image(texture.id(), img, uv, reference_tint);
         }
-        let detailed = d.detail.paint(ui, img, area, &d.field, &d.opts.view, d.proxy.scale, d.cur.is_some() || d.lasso.is_some() || d.rig.dragging());
+        let detailed = d.detail.paint(
+            ui,
+            img,
+            area,
+            &d.field,
+            &d.opts.view,
+            d.proxy.scale,
+            d.cur.is_some() || d.lasso.is_some() || d.rig.dragging() || face_ui::handles::captured(d),
+        );
         if !detailed {
             let tint = Color32::from_white_alpha((d.opts.view.working_opacity.clamp(0.0, 100.0) * 2.55).round() as u8);
             if d.opts.view.before {
@@ -1159,6 +1169,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         manual_rig::draw(d, &clip, area);
         face_ui::draw(d, &clip, area);
+        face_ui::handles::draw(d, &clip, area);
         // The lasso polygon being drawn (danger colour freezes, accent thaws; the mask overlay paints the
         // applied area red like the Freeze brush).
         if let Some((subtract, pts)) = &d.lasso

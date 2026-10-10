@@ -9,8 +9,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = detector.detect(&image)?;
     println!("faces={} landmarks={}", result.landmarks.len(), result.landmarks.first().map_or(0, Vec::len));
     if args.iter().any(|a| a == "--landmarks") {
-        let points: Vec<Vec<[f64; 2]>> =
-            result.landmarks.iter().map(|face| face.iter().map(|p| [f64::from(p.point.x()), f64::from(p.point.y())]).collect()).collect();
+        let points: Vec<Vec<[f64; 3]>> = result
+            .landmarks
+            .iter()
+            .map(|face| face.iter().map(|p| [f64::from(p.point.x()), f64::from(p.point.y()), f64::from(p.point.z())]).collect())
+            .collect();
         println!("{points:?}");
     }
     Ok(())

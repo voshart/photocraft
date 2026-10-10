@@ -527,3 +527,11 @@ view, while a stroke is active, or when detection has become stale.
 View keys: `zoomPercent:1..3200`, `fitView:true`, and `previewTool:"brush"|"hand"|"zoom"`.
 They change only the dialog view. Saved engine payloads use `faceWarpV1`, with
 five fixed-size source regions and slider values; replay never requires inference.
+`headYaw` and `headPitch` are relative turns in degrees, with
+`hypot(headYaw, headPitch) <= 30`. They require depth from a fresh detection;
+older depth-free face operations remain valid at zero turn. Positive yaw turns
+toward image-right; positive pitch looks up. Saved depth is optional
+`face.depth:{bounds:[x0,y0,x1,y1],samples:[[z x25] x25]}`, in document-pixel
+units relative to a virtual head pivot. Invalid, oversized, or folding turns
+return an error without changing the accepted preview/document. On-image handles
+modify these same absolute sliders, honoring linked eyes and navigation modes.

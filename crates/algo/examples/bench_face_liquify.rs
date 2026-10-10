@@ -20,28 +20,44 @@ fn main() -> Result<(), String> {
             outline,
         ],
         sliders: FaceSliders { eye_size: 20., smile: 30., nose_width: -15., face_width: -25., ..Default::default() },
+        depth: None,
     };
-    let mut oracle: Option<LiquifyField> = None;
-    for threads in [1, 4] {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| e.to_string())?;
-        let mut field = LiquifyField::new(Rect::new(0, 0, 6000, 4000), 4.0);
-        let start = std::time::Instant::now();
-        let area = pool.install(|| face.apply(&mut field))?;
-        if area.is_empty() {
-            return Err("Benchmark produced no face edit".into());
+    for rotation in [false, true] {
+        let mut face = face.clone();
+        if rotation {
+            face.depth = Some(Box::new(photocraft_algo::liquify::face::pose::FaceDepth {
+                bounds: [1500., 0., 4500., 3800.],
+                samples: std::array::from_fn(|j| {
+                    std::array::from_fn(|i| {
+                        let r = ((i as f64 - 12.) / 12.).hypot((j as f64 - 12.) / 12.);
+                        -300. - 600. * (-2. * r * r).exp()
+                    })
+                }),
+            }));
+            face.sliders.head_yaw = 15.;
         }
-        println!(
-            "24MP threads={threads} face-edit={:.1}ms nodes={} max-displacement={:.1}px",
-            start.elapsed().as_secs_f64() * 1000.,
-            field.d.len(),
-            field.max_displacement()
-        );
-        if let Some(previous) = &oracle {
-            if previous != &field {
-                return Err("Parallel replay differs from single-thread output".into());
+        let mut oracle: Option<LiquifyField> = None;
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| e.to_string())?;
+            let mut field = LiquifyField::new(Rect::new(0, 0, 6000, 4000), 4.0);
+            let start = std::time::Instant::now();
+            let area = pool.install(|| face.apply(&mut field))?;
+            if area.is_empty() {
+                return Err("Benchmark produced no face edit".into());
             }
-        } else {
-            oracle = Some(field);
+            println!(
+                "24MP rotation={rotation} threads={threads} face-edit={:.1}ms nodes={} max-displacement={:.1}px",
+                start.elapsed().as_secs_f64() * 1000.,
+                field.d.len(),
+                field.max_displacement()
+            );
+            if let Some(previous) = &oracle {
+                if previous != &field {
+                    return Err("Parallel replay differs from single-thread output".into());
+                }
+            } else {
+                oracle = Some(field);
+            }
         }
     }
     Ok(())
