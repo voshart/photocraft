@@ -535,3 +535,10 @@ toward image-right; positive pitch looks up. Saved depth is optional
 units relative to a virtual head pivot. Invalid, oversized, or folding turns
 return an error without changing the accepted preview/document. On-image handles
 modify these same absolute sliders, honoring linked eyes and navigation modes.
+
+Feature-position keys are `eyeMoveX`, `eyeMoveY`, `mouthMoveX`, `mouthMoveY`,
+`noseMoveX`, and `noseMoveY` (-100..100). Optional `rightEyeMoveX` and
+`rightEyeMoveY` override the shared eye position; omitted/null means linked.
+Positive X moves image-right; positive Y moves down. One unit is 0.2% of the
+original contour width, using the mean original eye width for both eyes so
+linked movement preserves their spacing. Center Move handles edit both axes.

@@ -327,7 +327,7 @@ fn slider(ui: &mut egui::Ui, label: &str, value: &mut f64, close: bool, help: &s
     ui.horizontal(|ui| {
         ui.add_sized([110.0, 20.0], egui::Label::new(label)).on_hover_text(help);
         ui.spacing_mut().slider_width = 120.0;
-        ui.add(egui::Slider::new(value, range).step_by(1.0).show_value(true)).on_hover_text(help).changed()
+        ui.add(egui::Slider::new(value, range).clamping(egui::SliderClamping::Edits).step_by(1.0).show_value(true)).on_hover_text(help).changed()
     })
     .inner
 }
@@ -343,12 +343,12 @@ fn eye_slider(ui: &mut egui::Ui, label: &str, left: &mut f64, right: &mut Option
         if let Some(column) = columns.first_mut() {
             column.small("Left");
             column.spacing_mut().slider_width = 75.0;
-            changed |= column.add(egui::Slider::new(left, -100.0..=100.0).step_by(1.0)).changed();
+            changed |= column.add(egui::Slider::new(left, -100.0..=100.0).clamping(egui::SliderClamping::Edits).step_by(1.0)).changed();
         }
         if let Some(column) = columns.get_mut(1) {
             column.small("Right");
             column.spacing_mut().slider_width = 75.0;
-            changed |= column.add(egui::Slider::new(&mut r, -100.0..=100.0).step_by(1.0)).changed();
+            changed |= column.add(egui::Slider::new(&mut r, -100.0..=100.0).clamping(egui::SliderClamping::Edits).step_by(1.0)).changed();
         }
     });
     *right = Some(r);
@@ -429,7 +429,12 @@ pub(super) fn panel(d: &mut LiquifyDialog, ui: &mut egui::Ui) {
                 ui.horizontal(|ui| {
                     ui.add_sized([110.0, 20.0], egui::Label::new("Turn left / right"));
                     changed |= ui
-                        .add(egui::Slider::new(&mut sliders.head_yaw, -yaw_limit..=yaw_limit).suffix("°").step_by(0.5))
+                        .add(
+                            egui::Slider::new(&mut sliders.head_yaw, -yaw_limit..=yaw_limit)
+                                .clamping(egui::SliderClamping::Edits)
+                                .suffix("°")
+                                .fixed_decimals(1),
+                        )
                         .on_hover_text("Drag left or right to turn toward that side of the photo")
                         .changed();
                 });
@@ -437,7 +442,12 @@ pub(super) fn panel(d: &mut LiquifyDialog, ui: &mut egui::Ui) {
                     ui.add_sized([110.0, 20.0], egui::Label::new("Look down / up"));
                     let pitch_limit = (900.0 - sliders.head_yaw.powi(2)).max(0.0).sqrt();
                     changed |= ui
-                        .add(egui::Slider::new(&mut sliders.head_pitch, -pitch_limit..=pitch_limit).suffix("°").step_by(0.5))
+                        .add(
+                            egui::Slider::new(&mut sliders.head_pitch, -pitch_limit..=pitch_limit)
+                                .clamping(egui::SliderClamping::Edits)
+                                .suffix("°")
+                                .fixed_decimals(1),
+                        )
                         .on_hover_text("Negative looks down; positive looks up")
                         .changed();
                 });
@@ -445,18 +455,21 @@ pub(super) fn panel(d: &mut LiquifyDialog, ui: &mut egui::Ui) {
             ui.small("Uses the existing photo: hidden skin, ears and hair cannot be reconstructed.");
         });
         egui::CollapsingHeader::new("Eyes").default_open(true).show(ui, |ui| {
-            let mut linked =
-                sliders.right_eye_size.is_none() && sliders.right_eye_width.is_none() && sliders.right_eye_height.is_none() && sliders.right_eye_tilt.is_none();
+            let mut linked = sliders.eyes_linked();
             if widgets::checkbox(ui, &mut linked, "Adjust both eyes together").changed() {
                 sliders.right_eye_size = if linked { None } else { Some(sliders.eye_size) };
                 sliders.right_eye_width = if linked { None } else { Some(sliders.eye_width) };
                 sliders.right_eye_height = if linked { None } else { Some(sliders.eye_height) };
                 sliders.right_eye_tilt = if linked { None } else { Some(sliders.eye_tilt) };
+                sliders.right_eye_move_x = if linked { None } else { Some(sliders.eye_move_x) };
+                sliders.right_eye_move_y = if linked { None } else { Some(sliders.eye_move_y) };
                 changed = true;
             }
             changed |= eye_slider(ui, "Eye size", &mut sliders.eye_size, &mut sliders.right_eye_size, linked);
             changed |= eye_slider(ui, "Eye height", &mut sliders.eye_height, &mut sliders.right_eye_height, linked);
             egui::CollapsingHeader::new("More eye adjustments").show(ui, |ui| {
+                changed |= eye_slider(ui, "Move left / right", &mut sliders.eye_move_x, &mut sliders.right_eye_move_x, linked);
+                changed |= eye_slider(ui, "Move up / down", &mut sliders.eye_move_y, &mut sliders.right_eye_move_y, linked);
                 changed |= eye_slider(ui, "Eye width", &mut sliders.eye_width, &mut sliders.right_eye_width, linked);
                 changed |= eye_slider(ui, "Eye tilt", &mut sliders.eye_tilt, &mut sliders.right_eye_tilt, linked);
                 changed |= slider(ui, "Eye distance", &mut sliders.eye_spacing, false, "Negative brings the eyes closer; positive moves them further apart");
@@ -472,10 +485,16 @@ pub(super) fn panel(d: &mut LiquifyDialog, ui: &mut egui::Ui) {
                 changed |= slider(ui, "Upper lip", &mut sliders.upper_lip, false, "Lower ← → Raise the upper lip outline");
                 changed |= slider(ui, "Lower lip", &mut sliders.lower_lip, false, "Raise ← → Lower the lower lip outline");
             });
+            egui::CollapsingHeader::new("Mouth position").show(ui, |ui| {
+                changed |= slider(ui, "Move left / right", &mut sliders.mouth_move_x, false, "Negative moves left; positive moves right");
+                changed |= slider(ui, "Move up / down", &mut sliders.mouth_move_y, false, "Negative moves up; positive moves down");
+            });
         });
         egui::CollapsingHeader::new("Nose").show(ui, |ui| {
             changed |= slider(ui, "Nose width", &mut sliders.nose_width, false, "Narrower ← → Wider");
             changed |= slider(ui, "Nose length", &mut sliders.nose_height, false, "Shorter ← → Longer");
+            changed |= slider(ui, "Move left / right", &mut sliders.nose_move_x, false, "Negative moves left; positive moves right");
+            changed |= slider(ui, "Move up / down", &mut sliders.nose_move_y, false, "Negative moves up; positive moves down");
         });
         egui::CollapsingHeader::new("Face shape").show(ui, |ui| {
             changed |= slider(ui, "Face width", &mut sliders.face_width, false, "Slimmer ← → Wider");
@@ -485,6 +504,12 @@ pub(super) fn panel(d: &mut LiquifyDialog, ui: &mut egui::Ui) {
         });
     });
     if changed {
+        let turn = sliders.head_yaw.hypot(sliders.head_pitch);
+        // Decimal entry may round a dynamic endpoint slightly beyond the circular limit.
+        if turn > 30.0 {
+            sliders.head_yaw *= 30.0 / turn;
+            sliders.head_pitch *= 30.0 / turn;
+        }
         let result = apply_sliders(d, sliders);
         d.face.feedback(result);
     }
@@ -520,6 +545,38 @@ pub(super) fn draw(d: &LiquifyDialog, painter: &egui::Painter, area: egui::Rect)
 mod tests {
     use super::*;
     use crate::PhotocraftApp;
+    #[test]
+    fn face_panel_and_position_controls_preserve_saved_values_without_user_input() {
+        let mut app = app();
+        let d = app.distort.liquify.as_mut().unwrap();
+        ready(d);
+        d.face.faces.first_mut().unwrap().warp.depth =
+            Some(Box::new(photocraft_algo::liquify::face::pose::FaceDepth { bounds: [0., 0., 300., 300.], samples: [[-30.; 25]; 25] }));
+        let sliders = FaceSliders { head_yaw: 10., eye_size: 12.25, eye_move_x: 5.25, mouth_move_y: -6.75, ..Default::default() };
+        apply_sliders(d, sliders.clone()).unwrap();
+        let field = d.field.clone();
+        let strokes = d.strokes.clone();
+        let ctx = egui::Context::default();
+        PhotocraftApp::setup_context(&ctx, Default::default());
+        let mut position = 6.25;
+        let mut left = 2.35;
+        let mut right = Some(-3.75);
+        for _ in 0..4 {
+            let mut out = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280., 1600.))), ..Default::default() },
+                |ui| {
+                    panel(d, ui);
+                    assert!(!slider(ui, "Move up / down", &mut position, false, "Position"));
+                    assert!(!eye_slider(ui, "Move left / right", &mut left, &mut right, false));
+                },
+            );
+            out.textures_delta.clear();
+            assert_eq!(d.face.sliders, sliders);
+            assert_eq!(d.field, field);
+            assert_eq!(d.strokes, strokes);
+            assert_eq!((position, left, right), (6.25, 2.35, Some(-3.75)));
+        }
+    }
     pub(super) fn app() -> PhotocraftApp {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
         app.session.execute("file.new", json!({"width":300,"height":300})).unwrap();
@@ -682,6 +739,14 @@ mod tests {
             "eyeHeight",
             "eyeTilt",
             "eyeSpacing",
+            "eyeMoveX",
+            "eyeMoveY",
+            "rightEyeMoveX",
+            "rightEyeMoveY",
+            "mouthMoveX",
+            "mouthMoveY",
+            "noseMoveX",
+            "noseMoveY",
             "mouthWidth",
             "mouthHeight",
             "smile",

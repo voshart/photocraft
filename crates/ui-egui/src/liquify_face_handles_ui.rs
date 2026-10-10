@@ -4,6 +4,7 @@ use egui::{Pos2, Rect, Vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Edit {
+    Move,
     EyeSize,
     EyeWidth,
     EyeHeight,
@@ -53,6 +54,17 @@ fn handles(warp: &FaceWarp, region: usize) -> Vec<Handle> {
     let width = (p[4][0] - p[0][0]).hypot(p[4][1] - p[0][1]).max(1.0);
     let mut out = Vec::new();
     let mut add = |edit, point, axis, units, label| out.push(Handle { edit, point: warp.project_point(point), axis, units, label });
+    if region < 4
+        && let Ok(units) = warp.move_units(region)
+    {
+        let center = p.iter().fold([0.0; 2], |a, p| [a[0] + p[0] / 8.0, a[1] + p[1] / 8.0]);
+        let label = match region {
+            0 | 1 => "Move eye: drag in any direction",
+            2 => "Move mouth: drag in any direction",
+            _ => "Move nose: drag in any direction",
+        };
+        add(Edit::Move, center, [0., 0.], units, label);
+    }
     match region {
         0 | 1 => {
             let side = if region == 0 { 0 } else { 4 };
@@ -97,6 +109,41 @@ fn edited(drag: &Drag, delta: Vec2) -> FaceSliders {
         }
     };
     match drag.handle.edit {
+        Edit::Move => {
+            // Older saved edits can unlink eye shape before position overrides existed.
+            // Keep the other eye stationary in that case, including a left-eye drag.
+            if !s.eyes_linked() {
+                s.right_eye_move_x.get_or_insert(s.eye_move_x);
+                s.right_eye_move_y.get_or_insert(s.eye_move_y);
+            }
+            let change_x = f64::from(delta.x) / (f64::from(drag.zoom) * drag.handle.units);
+            let change_y = f64::from(delta.y) / (f64::from(drag.zoom) * drag.handle.units);
+            let move_axis = |value: &mut f64, change: f64| *value = (*value + change).clamp(-100., 100.);
+            let move_eye = |left: &mut f64, right: &mut Option<f64>, change| {
+                if drag.region == 1
+                    && let Some(value) = right
+                {
+                    move_axis(value, change);
+                } else {
+                    move_axis(left, change);
+                }
+            };
+            match drag.region {
+                0 | 1 => {
+                    move_eye(&mut s.eye_move_x, &mut s.right_eye_move_x, change_x);
+                    move_eye(&mut s.eye_move_y, &mut s.right_eye_move_y, change_y);
+                }
+                2 => {
+                    move_axis(&mut s.mouth_move_x, change_x);
+                    move_axis(&mut s.mouth_move_y, change_y);
+                }
+                3 => {
+                    move_axis(&mut s.nose_move_x, change_x);
+                    move_axis(&mut s.nose_move_y, change_y);
+                }
+                _ => {}
+            }
+        }
         Edit::EyeSize => eye(&mut s.eye_size, &mut s.right_eye_size),
         Edit::EyeWidth => eye(&mut s.eye_width, &mut s.right_eye_width),
         Edit::EyeHeight => eye(&mut s.eye_height, &mut s.right_eye_height),
@@ -196,7 +243,9 @@ pub(in super::super) fn interact(d: &mut LiquifyDialog, ui: &egui::Ui, area: Rec
     let retained = d.face.handles.hover.filter(|region| handles(&warp, *region).iter().any(|h| screen(d, area, h).distance(pos) < 22.));
     let retained_hot = retained.filter(|region| handles(&warp, *region).iter().any(|h| screen(d, area, h).distance(pos) < 9.));
     let core = feature_at(&warp, d, area, pos, 0.).filter(|index| *index < 4);
-    let region = retained_hot.or(core).or(retained).or_else(|| feature_at(&warp, d, area, pos, 14.));
+    // A nearby lip/eye edge must not keep stealing the center of the next feature.
+    let center = core.filter(|region| handles(&warp, *region).iter().any(|h| h.edit == Edit::Move && screen(d, area, h).distance(pos) <= 6.));
+    let region = center.or(retained_hot).or(core).or(retained).or_else(|| feature_at(&warp, d, area, pos, 14.));
     d.face.handles.hover = region;
     d.face.handles.hot = None;
     let Some(region) = region else { return };
@@ -205,7 +254,7 @@ pub(in super::super) fn interact(d: &mut LiquifyDialog, ui: &egui::Ui, area: Rec
     let hot = nearest.filter(|h| screen(d, area, h).distance(pos) <= 14.);
     d.face.handles.hot = hot.map(|h| h.edit);
     if let Some(h) = hot {
-        ui.ctx().set_cursor_icon(if h.edit == Edit::Turn {
+        ui.ctx().set_cursor_icon(if matches!(h.edit, Edit::Turn | Edit::Move) {
             egui::CursorIcon::Move
         } else if h.axis[0] != 0. {
             egui::CursorIcon::ResizeHorizontal
@@ -245,7 +294,13 @@ pub(in super::super) fn draw(d: &LiquifyDialog, painter: &egui::Painter, area: R
         painter.circle_filled(pos, if active { 8. } else { 6. }, t.dock);
         painter.circle_stroke(pos, if active { 8. } else { 6. }, egui::Stroke::new(1.5, t.accent));
         let axis = egui::vec2(h.axis[0] as f32, h.axis[1] as f32);
-        painter.arrow(pos - axis * 4., axis * 8., egui::Stroke::new(1.2, t.accent));
+        if h.edit == Edit::Move {
+            for axis in [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y] {
+                painter.arrow(pos, axis * 6., egui::Stroke::new(1.2, t.accent));
+            }
+        } else {
+            painter.arrow(pos - axis * 4., axis * 8., egui::Stroke::new(1.2, t.accent));
+        }
         if h.edit == Edit::Turn {
             painter.arrow(pos + egui::vec2(0., 4.), egui::vec2(0., -8.), egui::Stroke::new(1.2, t.accent));
         }
@@ -264,6 +319,142 @@ pub(in super::super) fn draw(d: &LiquifyDialog, painter: &egui::Painter, area: R
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_feature_center_takes_priority_over_another_features_retained_edge_handle() {
+        let mut app = super::super::tests::app();
+        let d = app.distort.liquify.as_mut().unwrap();
+        super::super::tests::ready(d);
+        d.zoom = 1.;
+        d.center = [150., 150.];
+        let area = Rect::from_min_size(Pos2::ZERO, egui::vec2(300., 300.));
+        let warp = d.face.faces.first().unwrap().warp.clone();
+        let lip = handles(&warp, 2).into_iter().find(|h| h.edit == Edit::UpperLip).unwrap();
+        let nose = handles(&warp, 3).into_iter().find(|h| h.edit == Edit::Move).unwrap();
+        let shift = f64::from(screen(d, area, &lip).y + 5.) - nose.point[1];
+        let rig = &mut d.face.faces.first_mut().unwrap().warp.regions[3];
+        rig.bounds[1] += shift;
+        rig.bounds[3] += shift;
+        for p in &mut rig.source {
+            p[1] += shift;
+        }
+        rig.target = rig.source;
+        let warp = d.face.faces.first().unwrap().warp.clone();
+        let mouth = handles(&warp, 2).into_iter().find(|h| h.edit == Edit::Move).unwrap();
+        let nose = handles(&warp, 3).into_iter().find(|h| h.edit == Edit::Move).unwrap();
+        let ctx = egui::Context::default();
+        crate::PhotocraftApp::setup_context(&ctx, Default::default());
+        for pos in [screen(d, area, &mouth), screen(d, area, &nose)] {
+            let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(area), events: vec![egui::Event::PointerMoved(pos)], ..Default::default() }, |ui| {
+                let response = ui.interact(area, egui::Id::new("neighbor-center-test"), egui::Sense::click_and_drag());
+                interact(d, ui, area, &response);
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(d.face.handles.hover, Some(3));
+        assert_eq!(d.face.handles.hot, Some(Edit::Move));
+        assert!(d.strokes.is_empty());
+    }
+    #[test]
+    fn center_moves_use_both_axes_are_absolute_and_respect_eye_linking_and_zoom() {
+        let mut app = super::super::tests::app();
+        let d = app.distort.liquify.as_mut().unwrap();
+        super::super::tests::ready(d);
+        let warp = d.face.faces.first().unwrap().warp.clone();
+        for region in 0..4 {
+            let h = handles(&warp, region).into_iter().find(|h| h.edit == Edit::Move).unwrap();
+            let mut g = Drag { region, handle: h, start: Pos2::ZERO, zoom: 2., sliders: FaceSliders::default() };
+            let delta = egui::vec2((g.handle.units * 40.) as f32, (g.handle.units * -60.) as f32);
+            let s = edited(&g, delta);
+            let (x, y) = match region {
+                0 | 1 => (s.eye_move_x, s.eye_move_y),
+                2 => (s.mouth_move_x, s.mouth_move_y),
+                _ => (s.nose_move_x, s.nose_move_y),
+            };
+            assert!((x - 20.).abs() < 1e-5 && (y + 30.).abs() < 1e-5);
+            assert_eq!((s.eye_size, s.nose_width, s.smile), (0., 0., 0.));
+            assert_eq!(edited(&g, Vec2::ZERO), g.sliders);
+            g.zoom = 1.;
+            assert_eq!(edited(&g, delta * 0.5), s);
+            if region == 1 {
+                g.sliders.right_eye_move_x = Some(10.);
+                g.sliders.right_eye_move_y = Some(-10.);
+                let independent = edited(&g, delta * 0.5);
+                assert_eq!((independent.eye_move_x, independent.eye_move_y), (0., 0.));
+                assert!((independent.right_eye_move_x.unwrap() - 30.).abs() < 1e-5);
+                assert!((independent.right_eye_move_y.unwrap() + 40.).abs() < 1e-5);
+                let limited = edited(&g, egui::vec2(10000., -10000.));
+                assert_eq!((limited.right_eye_move_x, limited.right_eye_move_y), (Some(100.), Some(-100.)));
+            }
+        }
+    }
+
+    #[test]
+    fn center_move_respects_unlinked_eyes_from_older_shape_only_edits() {
+        let h = Handle { edit: Edit::Move, point: [0.; 2], axis: [0.; 2], units: 1., label: "Move eye" };
+        let mut g = Drag {
+            region: 0,
+            handle: h,
+            start: Pos2::ZERO,
+            zoom: 1.,
+            sliders: FaceSliders { right_eye_size: Some(20.), eye_move_x: 5., eye_move_y: -5., ..Default::default() },
+        };
+        let s = edited(&g, egui::vec2(10., -20.));
+        assert_eq!((s.eye_move_x, s.eye_move_y), (15., -25.));
+        assert_eq!((s.right_eye_move_x, s.right_eye_move_y), (Some(5.), Some(-5.)));
+        g.region = 1;
+        let s = edited(&g, egui::vec2(10., -20.));
+        assert_eq!((s.eye_move_x, s.eye_move_y), (5., -5.));
+        assert_eq!((s.right_eye_move_x, s.right_eye_move_y), (Some(15.), Some(-25.)));
+        assert_eq!(s.right_eye_size, Some(20.));
+    }
+
+    #[test]
+    fn hovering_each_feature_center_captures_a_two_axis_move_without_brush_strokes() {
+        for region in 0..4 {
+            let mut app = super::super::tests::app();
+            let d = app.distort.liquify.as_mut().unwrap();
+            super::super::tests::ready(d);
+            d.zoom = 1.;
+            d.center = [150., 150.];
+            let area = Rect::from_min_size(Pos2::ZERO, egui::vec2(300., 300.));
+            let ctx = egui::Context::default();
+            crate::PhotocraftApp::setup_context(&ctx, Default::default());
+            let frame = |d: &mut LiquifyDialog, events| {
+                let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(area), events, ..Default::default() }, |ui| {
+                    let response = ui.interact(area, egui::Id::new("center-move-test"), egui::Sense::click_and_drag());
+                    interact(d, ui, area, &response);
+                    draw(d, ui.painter(), area);
+                });
+                output.textures_delta.clear();
+            };
+            frame(d, vec![]);
+            let warp = d.face.faces.first().unwrap().warp.clone();
+            let h = handles(&warp, region).into_iter().find(|h| h.edit == Edit::Move).unwrap();
+            let p = screen(d, area, &h);
+            frame(d, vec![egui::Event::PointerMoved(p)]);
+            assert_eq!(d.face.handles.hover, Some(region));
+            assert_eq!(d.face.handles.hot, Some(Edit::Move));
+            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            frame(d, vec![button(p, true)]);
+            assert!(captured(d));
+            let end = p + egui::vec2(2., -2.);
+            frame(d, vec![egui::Event::PointerMoved(end)]);
+            frame(d, vec![button(end, false)]);
+            assert!(!captured(d));
+            assert_eq!(d.strokes.len(), 1);
+            assert_eq!(d.strokes[0].tool, photocraft_algo::liquify::LiquifyTool::FaceWarpV1);
+            let s = &d.face.sliders;
+            let (x, y) = match region {
+                0 | 1 => (s.eye_move_x, s.eye_move_y),
+                2 => (s.mouth_move_x, s.mouth_move_y),
+                _ => (s.nose_move_x, s.nose_move_y),
+            };
+            assert!(x > 0. && y < 0., "region {region}: {:?}", d.face.status);
+            assert_eq!((s.eye_size, s.smile, s.nose_width), (0., 0., 0.));
+            apply_sliders(d, FaceSliders::default()).unwrap();
+            assert!(d.field.is_identity());
+        }
+    }
     #[test]
     fn head_turn_and_forehead_handles_remain_separate_at_every_zoom() {
         let mut app = super::super::tests::app();

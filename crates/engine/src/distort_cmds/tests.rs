@@ -28,6 +28,21 @@ fn liquify_face_sliders_commit_and_undo_at_every_depth_and_reject_invalid_payloa
         assert_eq!(active_surface(&s), before);
         assert!(s.execute(LIQUIFY, json!({"strokes":[{"tool":"faceWarpV1"}]})).is_err());
         assert!(s.execute(LIQUIFY, json!({"strokes":[{"tool":"forwardWarp","face":face}]})).is_err());
+        for key in ["eyeMoveX", "eyeMoveY", "rightEyeMoveX", "rightEyeMoveY", "mouthMoveX", "mouthMoveY", "noseMoveX", "noseMoveY"] {
+            let mut moved = face.clone();
+            moved.sliders = FaceSliders::default();
+            let mut value = serde_json::to_value(moved).unwrap();
+            value["sliders"][key] = json!(40);
+            s.execute(LIQUIFY, json!({"strokes":[{"tool":"faceWarpV1","face":value}]})).unwrap();
+            assert_ne!(active_surface(&s), before, "{key} at depth {depth}");
+            s.undo();
+            assert_eq!(active_surface(&s), before);
+            for bad in [json!(101), json!(-101), json!("right"), json!([])] {
+                value["sliders"][key] = bad;
+                assert!(s.execute(LIQUIFY, json!({"strokes":[{"tool":"faceWarpV1","face":value}]})).is_err());
+                assert_eq!(active_surface(&s), before);
+            }
+        }
         let mut turned = face.clone();
         turned.depth = Some(Box::new(photocraft_algo::liquify::face::pose::FaceDepth { bounds: [10., 5., 70., 55.], samples: [[-10.; 25]; 25] }));
         turned.sliders.head_yaw = 15.;

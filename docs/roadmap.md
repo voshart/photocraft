@@ -249,7 +249,7 @@ Next:
    curves; chisel-soft / stroke-emboss bevel shapes; Photoshop's 8-bit blend rounding; non-Normal
    modes in Lab documents; smart-filter maths against Photoshop's (re-render oracle 5/30).
 3. **GPU**: only Multichannel documents and regions over the texture limit fall back to the CPU.
-4. **Vanishing Point, Camera Raw / Lens Correction, Face-Aware Liquify**. This personal fork adds an opt-in native MediaPipe detector, geometric feature sliders, hover-revealed on-image handles, and depth-based relative head turns capped at 30° (2026-10-10); expression transfer and full Photoshop behaviour remain open. See [the experimental Liquify notes](liquify-precision.md).
+4. **Vanishing Point, Camera Raw / Lens Correction, Face-Aware Liquify**. This personal fork adds an opt-in native MediaPipe detector, geometric feature sliders, hover-revealed on-image shape and feature-movement handles, and depth-based relative head turns capped at 30° (2026-10-10); expression transfer and full Photoshop behaviour remain open. See [the experimental Liquify notes](liquify-precision.md).
 5. **Panels**: Patterns, Styles, Glyphs, Character/Paragraph Styles, Timeline; Custom Shape tool.
 6. Print, Photomerge, Merge to HDR, video layers.
 

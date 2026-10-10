@@ -25,20 +25,30 @@ pub struct FaceSliders {
     pub eye_height: f64,
     pub eye_spacing: f64,
     pub eye_tilt: f64,
+    /// Image-axis translation: positive X moves right, positive Y moves down.
+    /// 100 moves 20% of the original feature width (mean width for linked eyes).
+    pub eye_move_x: f64,
+    pub eye_move_y: f64,
     pub right_eye_size: Option<f64>,
     pub right_eye_width: Option<f64>,
     pub right_eye_height: Option<f64>,
     pub right_eye_tilt: Option<f64>,
+    pub right_eye_move_x: Option<f64>,
+    pub right_eye_move_y: Option<f64>,
     /// Left and right always mean the sides of the displayed photo.
     pub left_eye_close: f64,
     pub right_eye_close: f64,
     pub mouth_width: f64,
     pub mouth_height: f64,
+    pub mouth_move_x: f64,
+    pub mouth_move_y: f64,
     pub upper_lip: f64,
     pub lower_lip: f64,
     pub smile: f64,
     pub nose_width: f64,
     pub nose_height: f64,
+    pub nose_move_x: f64,
+    pub nose_move_y: f64,
     pub face_width: f64,
     pub chin_height: f64,
     pub forehead: f64,
@@ -46,6 +56,12 @@ pub struct FaceSliders {
 }
 
 impl FaceSliders {
+    pub fn eyes_linked(&self) -> bool {
+        [self.right_eye_size, self.right_eye_width, self.right_eye_height, self.right_eye_tilt, self.right_eye_move_x, self.right_eye_move_y]
+            .iter()
+            .all(Option::is_none)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !self.head_yaw.is_finite() || !self.head_pitch.is_finite() || self.head_yaw.hypot(self.head_pitch) > 30.0 + 1e-9 {
             return Err("Head turn must be finite and within 30 degrees in total".into());
@@ -56,6 +72,12 @@ impl FaceSliders {
             self.eye_height,
             self.eye_spacing,
             self.eye_tilt,
+            self.eye_move_x,
+            self.eye_move_y,
+            self.mouth_move_x,
+            self.mouth_move_y,
+            self.nose_move_x,
+            self.nose_move_y,
             self.mouth_width,
             self.mouth_height,
             self.smile,
@@ -68,7 +90,7 @@ impl FaceSliders {
             self.upper_lip,
             self.lower_lip,
         ];
-        if [self.right_eye_size, self.right_eye_width, self.right_eye_height, self.right_eye_tilt]
+        if [self.right_eye_size, self.right_eye_width, self.right_eye_height, self.right_eye_tilt, self.right_eye_move_x, self.right_eye_move_y]
             .into_iter()
             .flatten()
             .any(|v| !v.is_finite() || !(-100.0..=100.0).contains(&v))
@@ -108,6 +130,22 @@ fn region(kind: RegionKind, points: [[f64; 2]; 8]) -> Result<RigWarp, String> {
 }
 
 impl FaceWarp {
+    /// Document pixels per position-slider unit, independent of other shape edits.
+    /// Both eyes use the same scale so a linked move preserves their spacing.
+    pub fn move_units(&self, index: usize) -> Result<f64, String> {
+        let width = |index: usize| -> Result<f64, String> {
+            let r = self.regions.get(index).ok_or("Missing face feature")?;
+            let a = r.source.first().ok_or("Missing feature start")?;
+            let b = r.source.get(4).ok_or("Missing feature end")?;
+            let width = (b[0] - a[0]).hypot(b[1] - a[1]);
+            if !width.is_finite() || !(1.0..=15_000.0).contains(&width) {
+                return Err("Invalid face feature width".into());
+            }
+            Ok(width)
+        };
+        Ok(if index < 2 { (width(0)? + width(1)?) * 0.001 } else { width(index)? * 0.002 })
+    }
+
     /// MediaPipe's published landmark indices, in document coordinates.
     pub fn from_landmarks(points: &[[f64; 2]]) -> Result<Self, String> {
         if points.len() != 478 || points.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1_000_000.0) {
@@ -247,6 +285,27 @@ impl FaceWarp {
                     r.target = r.next_gesture().close_eye(f)?.target;
                 }
             }
+            let movement = match index {
+                0 => [s.eye_move_x, s.eye_move_y],
+                1 => [s.right_eye_move_x.unwrap_or(s.eye_move_x), s.right_eye_move_y.unwrap_or(s.eye_move_y)],
+                2 => [s.mouth_move_x, s.mouth_move_y],
+                3 => [s.nose_move_x, s.nose_move_y],
+                _ => [0.0; 2],
+            };
+            if movement != [0.0; 2] {
+                let units = self.move_units(index)?;
+                let offset = [movement[0] * units, movement[1] * units];
+                // Keep source and translated contours inside a smooth local transition.
+                // Growing continuously from zero preserves existing saved shape edits.
+                r.bounds[0] -= offset[0].abs();
+                r.bounds[2] += offset[0].abs();
+                r.bounds[1] -= offset[1].abs();
+                r.bounds[3] += offset[1].abs();
+                for target in &mut r.target {
+                    target[0] += offset[0];
+                    target[1] += offset[1];
+                }
+            }
             prepare_steps(r)?;
         }
         Ok(out)
@@ -295,6 +354,88 @@ impl FaceWarp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn face_moves_translate_whole_contours_preserve_linked_eye_spacing_and_replay() {
+        let mut face = synthetic_face();
+        // Deliberately unequal eye widths: a linked move must still be one common offset.
+        face.regions[1].source[4][0] -= 3.;
+        face.regions[1].target = face.regions[1].source;
+        face.sliders =
+            FaceSliders { eye_move_x: 30., eye_move_y: -40., mouth_move_x: -35., mouth_move_y: 25., nose_move_x: 20., nose_move_y: -15., ..Default::default() };
+        let moved = face.adjusted().unwrap();
+        for (index, values) in [[30., -40.], [30., -40.], [-35., 25.], [20., -15.]].into_iter().enumerate() {
+            let unit = face.move_units(index).unwrap();
+            for (source, target) in moved[index].source.iter().zip(moved[index].target) {
+                assert!((target[0] - source[0] - values[0] * unit).abs() < 1e-10);
+                assert!((target[1] - source[1] - values[1] * unit).abs() < 1e-10);
+            }
+        }
+        assert!(moved[4].is_identity());
+        assert_eq!(face.move_units(0).unwrap(), face.move_units(1).unwrap());
+        let mut field = LiquifyField::new(Rect::new(0, 0, 300, 300), 2.0);
+        face.apply(&mut field).unwrap();
+        assert!(!field.is_identity());
+        let saved: FaceWarp = serde_json::from_value(serde_json::to_value(&face).unwrap()).unwrap();
+        let mut replay = LiquifyField::new(field.bounds, field.cell);
+        saved.apply(&mut replay).unwrap();
+        assert_eq!(field, replay);
+        face.sliders.right_eye_move_x = Some(0.);
+        face.sliders.right_eye_move_y = Some(0.);
+        assert!(face.adjusted().unwrap()[1].is_identity());
+        face.sliders = FaceSliders::default();
+        assert!(face.adjusted().unwrap().iter().all(RigWarp::is_identity));
+    }
+
+    #[test]
+    fn movement_preserves_existing_shape_edits_and_rejects_hostile_values_atomically() {
+        let mut face = synthetic_face();
+        face.sliders.eye_size = 25.;
+        face.sliders.left_eye_close = 30.;
+        let shaped = face.adjusted().unwrap();
+        face.sliders.eye_move_y = 50.;
+        let moved = face.adjusted().unwrap();
+        for (before, after) in shaped[0].target.iter().zip(moved[0].target) {
+            assert!((after[0] - before[0]).abs() < 1e-10);
+            assert!((after[1] - before[1] - 50. * face.move_units(0).unwrap()).abs() < 1e-10);
+        }
+        let mut field = LiquifyField::new(Rect::new(0, 0, 300, 300), 2.0);
+        let before = field.clone();
+        for value in [f64::NAN, f64::INFINITY, -101., 101.] {
+            face.sliders.nose_move_x = value;
+            assert!(face.apply(&mut field).is_err());
+            assert_eq!(field, before);
+            face.sliders.nose_move_x = 0.;
+            face.sliders.right_eye_move_y = Some(value);
+            assert!(face.apply(&mut field).is_err());
+            assert_eq!(field, before);
+            face.sliders.right_eye_move_y = None;
+        }
+        assert!(face.move_units(usize::MAX).is_err());
+        let legacy: FaceSliders = serde_json::from_str(r#"{"eyeSize":25}"#).unwrap();
+        assert_eq!((legacy.eye_move_x, legacy.nose_move_y, legacy.right_eye_move_x), (0., 0., None));
+    }
+
+    #[test]
+    fn move_transition_grows_with_the_feature_and_is_continuous_at_zero() {
+        let mut face = synthetic_face();
+        face.sliders.mouth_height = 40.;
+        let mut before = LiquifyField::new(Rect::new(0, 0, 300, 300), 2.0);
+        face.apply(&mut before).unwrap();
+        face.sliders.mouth_move_y = 0.0001;
+        let mut tiny = LiquifyField::new(before.bounds, before.cell);
+        face.apply(&mut tiny).unwrap();
+        let worst = before.d.iter().zip(&tiny.d).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs())).fold(0., f32::max);
+        assert!(worst < 0.001, "tiny move must not jump to a different shaped preview: {worst}");
+        for value in [-100., 100.] {
+            face.sliders.mouth_move_y = value;
+            face.sliders.mouth_move_x = value;
+            let moved = face.adjusted().unwrap();
+            assert!(moved[2].bounds[0] < face.regions[2].bounds[0]);
+            assert!(moved[2].bounds[3] > face.regions[2].bounds[3]);
+            let mut field = LiquifyField::new(before.bounds, before.cell);
+            face.apply(&mut field).unwrap();
+        }
+    }
     pub fn synthetic_face() -> FaceWarp {
         let eye = RigWarp::new(RegionKind::Eye, [35.0, 40.0, 135.0, 110.0]).unwrap();
         let mut right = eye.clone();

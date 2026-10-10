@@ -22,8 +22,14 @@ fn main() -> Result<(), String> {
         sliders: FaceSliders { eye_size: 20., smile: 30., nose_width: -15., face_width: -25., ..Default::default() },
         depth: None,
     };
-    for rotation in [false, true] {
+    for (movement, rotation) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut face = face.clone();
+        if movement {
+            face.sliders.eye_move_x = 25.;
+            face.sliders.eye_move_y = -15.;
+            face.sliders.mouth_move_y = 30.;
+            face.sliders.nose_move_x = -20.;
+        }
         if rotation {
             face.depth = Some(Box::new(photocraft_algo::liquify::face::pose::FaceDepth {
                 bounds: [1500., 0., 4500., 3800.],
@@ -46,7 +52,7 @@ fn main() -> Result<(), String> {
                 return Err("Benchmark produced no face edit".into());
             }
             println!(
-                "24MP rotation={rotation} threads={threads} face-edit={:.1}ms nodes={} max-displacement={:.1}px",
+                "24MP movement={movement} rotation={rotation} threads={threads} face-edit={:.1}ms nodes={} max-displacement={:.1}px",
                 start.elapsed().as_secs_f64() * 1000.,
                 field.d.len(),
                 field.max_displacement()

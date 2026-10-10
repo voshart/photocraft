@@ -26,6 +26,17 @@ from that starting shape, so repeated previews do not accumulate deformation.
 Hover over an eye, the mouth, nose, or face outline to reveal its on-image
 handles. Small arrows show the drag direction; hovering a handle names the edit.
 Eye handles adjust size, height and width, respecting the panel's linked-eye setting.
+Hover at the center of either eye, the nose, or the mouth to reveal a four-arrow
+**Move** handle. Drag it in any direction to reposition the whole feature; edge
+handles keep their shape adjustments. Linked eyes move by the same offset so
+their spacing stays unchanged. Uncheck **Adjust both eyes together** to move one
+eye independently. Position sliders live under **More eye adjustments**, **Mouth
+position**, and **Nose**. Zero restores the detected position. Movement is bounded
+to 20% of the original feature width on each axis to keep the skin transition local.
+The transition region expands smoothly with the move, and older saved edits
+with separate eye adjustments retain independent eye movement.
+Opening slider controls preserves saved fractional positions and head angles
+until you edit them; hovering never rounds or changes the photo.
 Mouth corners change smile and width; the top and bottom handles move the lip
 outlines. Nose and face-outline handles change nose width/length and face
 width, chin, forehead and jaw. Handles keep their screen size while zooming.
@@ -126,6 +137,56 @@ compiler, test, lint, WASM, and build results in `summary.json` and gate logs.
 A native build alone does not establish that every check passed or that portrait
 editing behaves correctly. Interactive portrait QA and performance comparisons
 remain separate work.
+
+### Feature-center moves: validation (2026-10-10)
+
+The final three-crate run passed **3,530 tests** across algo, engine, UI, their
+integration tests, and doc tests, with 42 opt-in tests ignored and two confirmed
+pre-existing failures explicitly excluded. The default run exposed a Windows
+path-separator assertion in
+`file_dialog::tests::save_dialogs_remember_where_each_document_was_last_saved`
+and 34 missing Japanese catalog entries from the original Liquify package in
+`i18n::tests::every_tl_literal_is_translated`. Both the save test and catalog are
+unchanged from the previous commit; all missing literals already existed there.
+The full default suite remains blocked by those failures; they were not disabled
+or weakened in source.
+
+The real-detector portrait test passes every position key at -100 and 100,
+including independent right-eye movement, then resets without changing the
+document. Other regressions cover coherent contour translation, preserved eye
+spacing, original-width drag sensitivity, both drag axes, zoom, older unlinked
+edits, center priority over a nearby retained edge handle, continuity at zero,
+serialization/replay, invalid inputs, and 8/16/32-bit apply/undo. A GUI regression
+also verifies that simply displaying sliders leaves fractional positions, shape
+values, rotation, the field, and history unchanged. Visual review caught the
+previous dynamic-angle slider rounding and the fixed mouth-region boundary;
+both are corrected.
+
+All-target Clippy for the three changed crates, layering, formatting, and the
+full WebAssembly check passed. The hostile-input command test passed separately.
+Eleven final offscreen captures cover both eye centers, nose and mouth centers,
+linked and independent moves, nose/mouth translation, a combined feature/turn
+edit, light theme, and 200% display scaling.
+
+The 24 MP release field benchmark uses 1,505,004 nodes. These are individual
+timings on this machine, excluding inference, display refinement, and upload:
+
+| Workload | One worker | Four workers |
+|---|---:|---:|
+| Existing shape sliders | 158.4 ms | 52.7 ms |
+| Shape sliders plus feature movement | 189.9 ms | 60.1 ms |
+| Shape sliders plus 15-degree turn | 247.6 ms | 104.8 ms |
+| Shape sliders, movement and 15-degree turn | 287.6 ms | 110.5 ms |
+
+Each workload produces bit-identical output with one and four workers.
+The broader `cargo xtask perf --quick` run passed. It uses smaller documents,
+does not apply full-size budgets, and skipped regression comparison because
+the committed baseline is from a different machine class. Existing unmeasured
+or over-budget UI scenarios remain reported by the harness.
+
+The final personal Windows build uses the optimized release profile and is
+**65.77 MiB** at `dist/windows/photocraft.exe`; its version check succeeds.
+It reports `dev build` because this fork is untagged, despite being optimized.
 
 ### Hover controls and depth turns: validation (2026-10-10)
 
