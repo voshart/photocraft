@@ -16,6 +16,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Windows build failed with exit code $LASTEXITCODE."
     }
+    & (Join-Path $PSScriptRoot 'setup-face-model.ps1')
     $outputDir = Join-Path $repoRoot 'dist/windows'
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     Copy-Item -LiteralPath (Join-Path $repoRoot 'target/debug/photocraft.exe') -Destination $outputDir -Force

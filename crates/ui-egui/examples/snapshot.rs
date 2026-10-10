@@ -65,6 +65,8 @@ fn main() {
     let custom_titlebar = args.iter().any(|a| a == "--custom-titlebar");
     // `--settle-ms N`: keep rendering frames for N ms before the capture (e.g. mid-job).
     let settle_ms: u64 = arg(&args, "--settle-ms").and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Wait between script calls when validating an asynchronous dialog (e.g. face detection).
+    let script_settle_ms: u64 = arg(&args, "--script-settle-ms").and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut harness =
         egui_kittest::Harness::builder().with_size(egui::vec2(w, h)).with_pixels_per_point(scale).with_max_steps(64).wgpu().build_eframe(move |cc| {
             PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
@@ -133,6 +135,10 @@ fn main() {
             harness.step();
         }
         harness.run_steps(4);
+        let settle_start = std::time::Instant::now();
+        while settle_start.elapsed() < std::time::Duration::from_millis(script_settle_ms) {
+            harness.step();
+        }
         if timing {
             eprintln!("{:>8.1} ms  {label}", t0.elapsed().as_secs_f64() * 1000.0);
         }

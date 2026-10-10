@@ -1,0 +1,11 @@
+[package]
+name = "photocraft-ml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+mediapipe = "=0.1.0"

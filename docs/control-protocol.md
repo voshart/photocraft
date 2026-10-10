@@ -501,3 +501,29 @@ Missing actions, recursive calls and nesting beyond 16 levels fail visibly; a ch
 the parent before its next step. Every nested command retains the normal automation permission check.
 Existing recordings containing expanded commands remain unchanged; remove those steps and record
 the named call again if desired.
+
+## Face sliders and Liquify view
+
+While the Liquify dialog is open, invoke `filter.liquify` with `ui` options:
+
+```json
+{"id":"filter.liquify","params":{"ui":{"faceEnabled":true}}}
+```
+
+Detection is opt-in and asynchronous. Inspect `faceControls.detecting`, `faces`,
+`status`, and `error` in the Liquify description before applying sliders. Other
+options: `detectFaces:true` (redetect), `faceEnabled:false` (hide controls, retain
+edit), `showFaceLandmarks:true`, and `faceSliders:{...}`. `faceSliders` replaces the
+current values; omitted values default to zero. An empty object resets the face.
+
+Slider keys: `eyeSize`, `eyeHeight`, `eyeWidth`, `eyeTilt`, `eyeSpacing`,
+`leftEyeClose`, `rightEyeClose`, `mouthWidth`, `mouthHeight`, `smile`, `upperLip`,
+`lowerLip`, `noseWidth`, `noseHeight`, `faceWidth`, `forehead`, `jawWidth`,
+`chinHeight`. Values range ?100..100, except closure (0..100). Optional
+`rightEyeSize`, `rightEyeHeight`, `rightEyeWidth`, `rightEyeTilt` override the
+shared eye value; null/omitted means linked eyes. Edits are rejected in Original
+view, while a stroke is active, or when detection has become stale.
+
+View keys: `zoomPercent:1..3200`, `fitView:true`, and `previewTool:"brush"|"hand"|"zoom"`.
+They change only the dialog view. Saved engine payloads use `faceWarpV1`, with
+five fixed-size source regions and slider values; replay never requires inference.

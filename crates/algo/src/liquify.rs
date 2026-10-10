@@ -23,6 +23,8 @@ use photocraft_geom::Rect;
 use photocraft_raster::Surface;
 use serde::{Deserialize, Serialize};
 
+#[path = "liquify_face.rs"]
+pub mod face;
 #[path = "liquify_precision.rs"]
 pub mod precision;
 #[path = "liquify_rig.rs"]
@@ -38,6 +40,8 @@ pub enum LiquifyTool {
     PrecisionWarp,
     /// Typed manual correspondence warp; not a point-list brush.
     RigWarpV1,
+    /// Absolute landmark-based slider edit; stored contours replay without inference.
+    FaceWarpV1,
     /// Undoable reset of displacement and protection inside this session.
     ResetSessionV1,
     Reconstruct,
@@ -79,6 +83,7 @@ impl LiquifyTool {
             LiquifyTool::ForwardWarp => "Forward Warp",
             LiquifyTool::PrecisionWarp => "Precision Push",
             LiquifyTool::RigWarpV1 => "Manual face rig",
+            LiquifyTool::FaceWarpV1 => "Face sliders",
             LiquifyTool::ResetSessionV1 => "Restore All",
             LiquifyTool::Reconstruct => "Reconstruct",
             LiquifyTool::Smooth => "Smooth",
@@ -104,7 +109,15 @@ impl LiquifyTool {
 
     /// Tools that act while the brush is held still (each recorded point is a dab).
     pub fn is_stationary(self) -> bool {
-        !matches!(self, LiquifyTool::ForwardWarp | LiquifyTool::PrecisionWarp | LiquifyTool::RigWarpV1 | LiquifyTool::PushLeft | LiquifyTool::LassoMask)
+        !matches!(
+            self,
+            LiquifyTool::ForwardWarp
+                | LiquifyTool::PrecisionWarp
+                | LiquifyTool::RigWarpV1
+                | LiquifyTool::FaceWarpV1
+                | LiquifyTool::PushLeft
+                | LiquifyTool::LassoMask
+        )
     }
 }
 
@@ -149,15 +162,27 @@ pub struct LiquifyStroke {
     /// Present only for RigWarpV1; no change to legacy brush payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rig: Option<rig::RigWarp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face: Option<Box<face::FaceWarp>>,
 }
 
 impl LiquifyStroke {
     pub fn new(tool: LiquifyTool, size: f64) -> Self {
-        LiquifyStroke { tool, size, density: d_density(), pressure: d_pressure(), rate: d_rate(), points: Vec::new(), amount: None, rig: None }
+        LiquifyStroke { tool, size, density: d_density(), pressure: d_pressure(), rate: d_rate(), points: Vec::new(), amount: None, rig: None, face: None }
     }
 
     /// Validates the stroke (finite numbers, 2 or 3 per point).
     pub fn validate(&self) -> Result<(), String> {
+        if self.tool == LiquifyTool::FaceWarpV1 {
+            self.face.as_ref().ok_or("faceWarpV1 needs a face payload")?.adjusted()?;
+            if self.rig.is_some() || !self.points.is_empty() {
+                return Err("Face sliders do not accept brush points or a manual rig".into());
+            }
+            return Ok(());
+        }
+        if self.face.is_some() {
+            return Err("Only faceWarpV1 accepts a face payload".into());
+        }
         if self.tool == LiquifyTool::RigWarpV1 {
             let r = self.rig.as_ref().ok_or("rigWarpV1 needs a rig payload")?;
             rig::prepare_steps(r)?;
@@ -249,6 +274,9 @@ impl LiquifyField {
     /// Applies one stroke. Returns the document rectangle whose output changed.
     pub fn apply_stroke(&mut self, s: &LiquifyStroke) -> Rect {
         match s.tool {
+            LiquifyTool::FaceWarpV1 => {
+                return s.face.as_ref().and_then(|f| f.apply(self).ok()).unwrap_or(Rect::EMPTY);
+            }
             LiquifyTool::RigWarpV1 => {
                 // Engine/UI entry points validate before dispatch. Lower-level replay
                 // remains total for corrupt or unsupported standalone stroke data.
@@ -410,7 +438,7 @@ impl LiquifyField {
 
     /// One dab at `c` with brush motion `delta`. Returns the document rect it affected.
     fn dab(&mut self, s: &LiquifyStroke, c: [f64; 2], delta: [f64; 2], point_pressure: f64) -> Rect {
-        if matches!(s.tool, LiquifyTool::LassoMask | LiquifyTool::RigWarpV1 | LiquifyTool::ResetSessionV1) {
+        if matches!(s.tool, LiquifyTool::LassoMask | LiquifyTool::RigWarpV1 | LiquifyTool::FaceWarpV1 | LiquifyTool::ResetSessionV1) {
             return Rect::EMPTY; // the lasso is polygon-only; never a brush dab
         }
         let r = (s.size / 2.0).max(0.5);

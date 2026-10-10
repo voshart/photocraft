@@ -19,6 +19,8 @@ use crate::canvas::ToolEvent;
 use crate::theme::Tokens;
 use crate::widgets;
 
+#[path = "liquify_face_ui.rs"]
+mod face_ui;
 #[path = "liquify_rig_ui.rs"]
 mod manual_rig;
 #[path = "liquify_precision_ui.rs"]
@@ -38,8 +40,155 @@ mod smart_session_tests;
 /// Longest side of the preview proxy (px).
 const PROXY_SIDE: usize = 1600;
 const LEFT_W: f32 = 48.0;
-const RIGHT_W: f32 = 292.0;
+const RIGHT_W: f32 = 340.0;
 const REDO_STACK_LIMIT: usize = 100;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewTool {
+    Brush,
+    Hand,
+    Zoom,
+}
+
+fn preview_zoom_factor(ctx: &egui::Context) -> f32 {
+    let notch = ctx.options(|o| o.input_options.line_scroll_speed).max(1.0);
+    ctx.input(|i| {
+        let pinch = i.zoom_delta();
+        if pinch.is_finite() && pinch > 0.0 && pinch != 1.0 {
+            return pinch;
+        }
+        // Main-canvas navigation folds Ctrl+wheel into horizontal smoothing.
+        // Read original events so Liquify's wheel steps are immediate and independent of that policy.
+        let points: f32 = i
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    let scale = match unit {
+                        egui::MouseWheelUnit::Point => 1.0,
+                        egui::MouseWheelUnit::Line => notch,
+                        egui::MouseWheelUnit::Page => i.viewport_rect().height(),
+                    };
+                    Some((delta.x + delta.y) * scale)
+                }
+                _ => None,
+            })
+            .sum();
+        if points.is_finite() { crate::wheel_nav::NOTCH.powf(points / notch) } else { 1.0 }
+    })
+}
+
+fn zoom_at(d: &mut LiquifyDialog, area: ERect, anchor: Pos2, zoom: f32) {
+    if !zoom.is_finite() || !anchor.x.is_finite() || !anchor.y.is_finite() {
+        return;
+    }
+    let before = to_doc(d, area, anchor);
+    d.zoom = zoom.clamp(0.01 / d.pixels_per_point, 32.0 / d.pixels_per_point);
+    d.zoom_fit = false;
+    let after = to_doc(d, area, anchor);
+    d.center = [d.center[0] + before[0] - after[0], d.center[1] + before[1] - after[1]];
+}
+
+fn view_control(d: &mut LiquifyDialog, value: &Value) -> Result<(), String> {
+    if let Some(v) = value.get("zoomPercent") {
+        let percent = v.as_f64().filter(|v| v.is_finite() && (1.0..=3200.0).contains(v)).ok_or("zoomPercent must be 1..3200")?;
+        d.zoom = (percent / 100.0) as f32 / d.pixels_per_point;
+        d.zoom_fit = false;
+    }
+    if let Some(v) = value.get("fitView") {
+        d.zoom_fit = v.as_bool().ok_or("fitView must be true or false")?;
+    }
+    if let Some(v) = value.get("previewTool") {
+        let tool = match v.as_str() {
+            Some("brush") => PreviewTool::Brush,
+            Some("hand") => PreviewTool::Hand,
+            Some("zoom") => PreviewTool::Zoom,
+            _ => return Err("previewTool is brush, hand or zoom".into()),
+        };
+        d.end();
+        d.preview_tool = tool;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    #[test]
+    fn liquify_view_accepts_pinch_and_ctrl_wheel_without_editing_pixels() {
+        let ctx = egui::Context::default();
+        PhotocraftApp::setup_context(&ctx, Default::default());
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        app.session.execute("file.new", json!({"width":512,"height":384})).unwrap();
+        open(&mut app, &ctx).unwrap();
+        let screen = ERect::from_min_size(Pos2::ZERO, vec2(1280.0, 900.0));
+        let position = pos2(370.0, 240.0);
+        let frame = |app: &mut PhotocraftApp, events| {
+            let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ui| show(app, ui.ctx()));
+            output.textures_delta.clear();
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(position)]);
+        // Areas need an initial sizing/hover pass before they receive pointer input.
+        for _ in 0..3 {
+            frame(&mut app, Vec::new());
+        }
+        let before = app.distort.liquify.as_ref().unwrap().zoom;
+        frame(&mut app, vec![egui::Event::Zoom(1.5)]);
+        let pinch = app.distort.liquify.as_ref().unwrap().zoom;
+        assert!((pinch - before * 1.5).abs() < 0.001, "before={before}, pinch={pinch}");
+        frame(
+            &mut app,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: vec2(0.0, 60.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::COMMAND,
+            }],
+        );
+        // Wheel deltas are smoothed across frames by egui, unlike a pinch event.
+        for _ in 0..4 {
+            frame(&mut app, Vec::new());
+        }
+        let d = app.distort.liquify.as_ref().unwrap();
+        assert!(d.zoom > pinch, "pinch={pinch}, ctrl-wheel={}", d.zoom);
+        assert!(d.strokes.is_empty());
+        assert!(d.field.is_identity());
+    }
+    #[test]
+    fn liquify_zoom_keeps_cursor_point_fixed_and_rejects_invalid_zoom() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), Default::default());
+        app.session.execute("file.new", json!({"width":512,"height":384})).unwrap();
+        open(&mut app, &egui::Context::default()).unwrap();
+        let d = app.distort.liquify.as_mut().unwrap();
+        d.zoom = 0.8;
+        let area = ERect::from_min_size(pos2(48.0, 30.0), vec2(800.0, 600.0));
+        let anchor = pos2(231.0, 179.0);
+        let original = to_doc(d, area, anchor);
+        for zoom in [2.0, 0.25, 32.0, 0.01, 0.8] {
+            zoom_at(d, area, anchor, zoom);
+            let after = to_doc(d, area, anchor);
+            assert!((after[0] - original[0]).abs() < 0.001);
+            assert!((after[1] - original[1]).abs() < 0.001);
+        }
+        let previous = d.zoom;
+        zoom_at(d, area, anchor, f32::NAN);
+        assert_eq!(d.zoom, previous);
+        assert!(view_control(d, &json!({"zoomPercent":-1})).is_err());
+        assert!(view_control(d, &json!({"zoomPercent":"big"})).is_err());
+        view_control(d, &json!({"zoomPercent":100,"previewTool":"hand"})).unwrap();
+        assert_eq!(d.zoom, 1.0);
+        assert!(d.preview_tool == PreviewTool::Hand);
+        assert!(!d.zoom_fit);
+        assert!(d.strokes.is_empty());
+        d.pixels_per_point = 2.0;
+        view_control(d, &json!({"zoomPercent":100})).unwrap();
+        assert_eq!(d.zoom, 0.5);
+        assert_eq!(d.describe()["zoomPercent"], 100.0);
+        let start = to_screen(d, area, [100.0, 100.0]);
+        let end = to_screen(d, area, [110.0, 100.0]);
+        assert_eq!((end.x - start.x) * d.pixels_per_point, 10.0);
+    }
+}
 
 /// Options shown in the properties panel (and settable over the control channel).
 #[derive(Clone, Debug)]
@@ -114,7 +263,7 @@ impl LiquifyOpts {
         }
         if let Some(t) = v.get("tool") {
             let tool: LiquifyTool = serde_json::from_value(t.clone()).map_err(|e| format!("bad tool: {e}"))?;
-            if matches!(tool, LiquifyTool::RigWarpV1 | LiquifyTool::ResetSessionV1) {
+            if matches!(tool, LiquifyTool::RigWarpV1 | LiquifyTool::FaceWarpV1 | LiquifyTool::ResetSessionV1) {
                 return Err("Use manual-rig controls or Restore All, not a non-brush tool selection".into());
             }
             self.tool = tool;
@@ -156,6 +305,7 @@ pub struct LiquifyDialog {
     proxy: ProxyImage,
     detail: precision::DetailPreview,
     rig: manual_rig::ManualRig,
+    face: face_ui::FaceControls,
     origin: session::Origin,
     out: Vec<[u8; 4]>,
     tex: Option<TextureHandle>,
@@ -167,6 +317,9 @@ pub struct LiquifyDialog {
     pub opts: LiquifyOpts,
     /// Screen px per document px (0 = fit on next frame) and the view centre (document px).
     zoom: f32,
+    pixels_per_point: f32,
+    zoom_fit: bool,
+    preview_tool: PreviewTool,
     center: [f64; 2],
     hover: Option<[f64; 2]>,
     last_dab: f64,
@@ -190,6 +343,8 @@ impl LiquifyDialog {
             "layer": self.layer.0,
             "tool": self.opts.tool,
             "size": self.opts.size,
+            "zoomPercent": self.zoom * self.pixels_per_point * 100.0,
+            "fitView":self.zoom_fit,
             "strokes": self.strokes.len() + usize::from(self.cur.is_some()),
             "redo": self.redo.len(),
             "meshSize": self.cell,
@@ -198,6 +353,7 @@ impl LiquifyDialog {
             "dabMs": self.dab_ms,
             "detailPreview": self.detail.describe(),
             "manualRig": self.rig.describe(),
+            "faceControls": self.face.describe(),
             "session": self.origin.describe(),
             "precisionView": self.opts.view.remembered(),
             "referenceSource": self.opts.view.reference,
@@ -216,6 +372,7 @@ impl LiquifyDialog {
             points: Vec::new(),
             amount: None,
             rig: None,
+            face: None,
         }
     }
 
@@ -230,6 +387,7 @@ impl LiquifyDialog {
 
     /// Starts a stroke; `alt` draws with the selected tool's opposite (see [`alt_tool`]).
     fn begin(&mut self, p: [f64; 3], now: f64, alt: bool) {
+        self.face.photo_changed();
         self.redo.clear();
         let tool = if alt { alt_tool(self.opts.tool) } else { self.opts.tool };
         if manual_rig::changes_geometry(tool) {
@@ -303,6 +461,7 @@ impl LiquifyDialog {
         self.field = LiquifyField::from_strokes(self.canvas, self.cell, &self.strokes);
         self.rig.recover(&self.strokes);
         self.rig.recover_next(self.redo.last());
+        face_ui::sync_history(self);
         self.dirty = Some([0, 0, self.proxy.w, self.proxy.h]);
         self.mask_dirty = true;
         self.render_dirty();
@@ -330,6 +489,7 @@ impl LiquifyDialog {
             self.rig.recover(&self.strokes);
             self.rig.recover_next(self.redo.last());
             self.rig.restore_preserved(guides);
+            face_ui::sync_history(self);
             self.mark(d, true);
             self.render_dirty();
         }
@@ -433,6 +593,7 @@ fn open_pixels(
         proxy,
         detail: precision::DetailPreview::new(surf.clone(), canvas, &st.doc, layer),
         rig: manual_rig::ManualRig::default(),
+        face: face_ui::FaceControls::default(),
         origin: session::Origin::new(st.doc.clone()),
         out,
         tex: None,
@@ -442,6 +603,9 @@ fn open_pixels(
         mask_dirty: true,
         opts: LiquifyOpts::default(),
         zoom: 0.0,
+        pixels_per_point: ctx.pixels_per_point().max(0.01),
+        zoom_fit: true,
+        preview_tool: PreviewTool::Brush,
         center,
         hover: None,
         last_dab: 0.0,
@@ -500,9 +664,13 @@ pub fn control(app: &mut PhotocraftApp, ui: &Value) -> Result<Value, String> {
     if ui.get("tool").is_some() {
         d.end();
         d.rig.enabled = false;
+        d.preview_tool = PreviewTool::Brush;
+        d.face.enabled = false;
     }
+    view_control(d, ui)?;
     d.opts.apply(ui)?;
     manual_rig::control(d, ui)?;
+    face_ui::control(d, ui)?;
     let num = |k: &str| ui.get(k).and_then(Value::as_f64).map(|v| v as f32);
     let flag = |k: &str| ui.get(k).and_then(Value::as_bool);
     if flag("undo") == Some(true) {
@@ -546,7 +714,7 @@ pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) {
     if d.origin.busy() {
         return;
     }
-    if d.opts.view.before {
+    if d.opts.view.before || d.face.enabled || d.preview_tool != PreviewTool::Brush {
         d.end();
         return;
     }
@@ -591,6 +759,24 @@ pub fn keys(app: &mut PhotocraftApp, ctx: &egui::Context) {
         return;
     }
     let Some(d) = app.distort.liquify.as_mut() else { return };
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0)) {
+        d.zoom_fit = true;
+    }
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1)) {
+        d.zoom = 1.0 / d.pixels_per_point;
+        d.zoom_fit = false;
+    }
+    let zoom_in = ctx.input_mut(|i| {
+        i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+            || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+            || i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Plus)
+    });
+    let zoom_out = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus));
+    if zoom_in || zoom_out {
+        let zoom = if d.zoom > 0.0 { d.zoom } else { 1.0 / d.pixels_per_point };
+        d.zoom = (zoom * if zoom_in { 1.25 } else { 0.8 }).clamp(0.01 / d.pixels_per_point, 32.0 / d.pixels_per_point);
+        d.zoom_fit = false;
+    }
     let cmd_shift = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
     if ctx.input_mut(|i| i.consume_key(cmd_shift, egui::Key::Z)) {
         d.redo();
@@ -607,6 +793,17 @@ pub fn keys(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
         d.global(LiquifyTool::ThawAll, None);
+    }
+    if ctx.egui_wants_keyboard_input() {
+        return;
+    }
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+        d.end();
+        d.preview_tool = PreviewTool::Hand;
+    }
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z)) {
+        d.end();
+        d.preview_tool = PreviewTool::Zoom;
     }
     if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::OpenBracket)) {
         d.opts.size = (d.opts.size * 0.9).max(1.0);
@@ -632,6 +829,8 @@ pub fn keys(app: &mut PhotocraftApp, ctx: &egui::Context) {
             d.end();
             d.rig.enabled = false;
             d.opts.tool = t;
+            d.preview_tool = PreviewTool::Brush;
+            d.face.enabled = false;
         }
     }
 }
@@ -699,6 +898,12 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let mut mods = egui::Modifiers::NONE;
     egui::Area::new(egui::Id::new("liquify-dialog")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
         let Some(d) = app.distort.liquify.as_mut() else { return };
+        let density = ctx.pixels_per_point().max(0.01);
+        if density != d.pixels_per_point {
+            d.zoom *= d.pixels_per_point / density;
+            d.pixels_per_point = density;
+        }
+        face_ui::poll(d, ctx);
         d.upload(ctx);
         let (full, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
         let painter = ui.painter().clone();
@@ -707,7 +912,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         let title = ERect::from_min_size(full.min, vec2(full.width(), 30.0));
         painter.rect_filled(title, 0.0, t.dock);
         painter.line_segment([title.left_bottom(), title.right_bottom()], Stroke::new(1.0, t.separator));
-        let pct = if d.zoom > 0.0 { d.zoom * 100.0 } else { 100.0 };
+        let pct = if d.zoom > 0.0 { d.zoom * d.pixels_per_point * 100.0 } else { 100.0 };
         painter.text(
             title.center(),
             Align2::CENTER_CENTER,
@@ -728,13 +933,32 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
                 LiquifyTool::LassoMask => tl!("Freeze Lasso: drag to freeze an area, Alt-drag to thaw it (L)").to_string(),
                 _ => format!("{} ({})", tl!(tool.label()), shortcut(tool)),
             };
-            if crate::icons::button(&mut strip, tool_icon(tool), 34.0, d.opts.tool == tool, &tip).clicked() {
+            if crate::icons::button(&mut strip, tool_icon(tool), 34.0, d.preview_tool == PreviewTool::Brush && !d.face.enabled && d.opts.tool == tool, &tip)
+                .clicked()
+            {
                 d.end();
                 d.rig.enabled = false;
                 d.opts.tool = tool;
+                d.preview_tool = PreviewTool::Brush;
+                d.face.enabled = false;
             }
             if matches!(tool, LiquifyTool::Smooth | LiquifyTool::PushLeft | LiquifyTool::Thaw) {
                 strip.add_space(6.0);
+            }
+        }
+        strip.add_space(10.0);
+        if crate::icons::button(&mut strip, "scan", 34.0, d.face.enabled, "Face adjustments: turn on automatic detection and sliders").clicked() {
+            let enabled = !d.face.enabled;
+            let result = face_ui::set_enabled(d, enabled);
+            d.face.feedback(result);
+        }
+        for (tool, icon, tip) in [
+            (PreviewTool::Hand, "hand", "Move view (H). You can also hold Space or drag with the middle mouse button."),
+            (PreviewTool::Zoom, "zoom-in", "Zoom (Z). Click to zoom in; Alt-click to zoom out."),
+        ] {
+            if crate::icons::button(&mut strip, icon, 34.0, d.preview_tool == tool, tip).clicked() {
+                d.end();
+                d.preview_tool = tool;
             }
         }
         // Right properties panel.
@@ -743,111 +967,143 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         painter.line_segment([right.left_top(), right.left_bottom()], Stroke::new(1.0, t.separator));
         let property_rect = ERect::from_min_max(right.min + vec2(14.0, 12.0), pos2(right.right() - 14.0, (right.bottom() - 68.0).max(right.top() + 12.0)));
         let mut props = ui.new_child(egui::UiBuilder::new().max_rect(property_rect));
-        egui::ScrollArea::vertical().id_salt("liquify-props").show(&mut props, |ui| {
-            ui.spacing_mut().item_spacing.y = 6.0;
-            ui.small(format!("{}: {}", tl!("Editing"), d.layer_name));
-            if d.origin.isolated() {
-                ui.small(tl!("Editing existing Smart Filter: isolated effect preview."));
-                ui.small(tl!("Layer masks, filter blending, and later filters remain in the document."));
-            }
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!d.strokes.is_empty() || d.cur.is_some(), egui::Button::new(tl!("Undo"))).clicked() {
-                    d.undo();
+        egui::ScrollArea::vertical().id_salt("liquify-props").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible).show(
+            &mut props,
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.small(format!("{}: {}", tl!("Editing"), d.layer_name));
+                if d.origin.isolated() {
+                    ui.small(tl!("Editing existing Smart Filter: isolated effect preview."));
+                    ui.small(tl!("Layer masks, filter blending, and later filters remain in the document."));
                 }
-                if ui.add_enabled(!d.redo.is_empty(), egui::Button::new(tl!("Redo"))).clicked() {
-                    d.redo();
-                }
-            });
-            if widgets::secondary_button(ui, tl!("Precision Push preset"), 230.0).clicked() {
-                d.end();
-                d.rig.enabled = false;
-                d.opts.tool = LiquifyTool::PrecisionWarp;
-                d.opts.density = 65.0;
-                d.opts.pressure = 35.0;
-            }
-            widgets::section_label(ui, tl!("Brush Tool Options"));
-            widgets::slider_row(ui, tl!("Size"), &mut d.opts.size, 1.0..=3000.0, "", None);
-            widgets::slider_row(ui, tl!("Density"), &mut d.opts.density, 0.0..=100.0, "", None);
-            widgets::slider_row(ui, tl!("Pressure"), &mut d.opts.pressure, 0.0..=100.0, "", None);
-            widgets::slider_row(ui, tl!("Rate"), &mut d.opts.rate, 0.0..=100.0, "", None);
-            widgets::hairline(ui);
-            widgets::section_label(ui, tl!("Brush Reconstruct Options"));
-            widgets::slider_row(ui, tl!("Amount"), &mut d.opts.reconstruct_amount, 0.0..=100.0, "%", None);
-            ui.horizontal(|ui| {
-                if widgets::secondary_button(ui, tl!("Reconstruct"), 110.0).clicked() {
-                    let a = f64::from(d.opts.reconstruct_amount);
-                    d.global(LiquifyTool::ReconstructAll, Some(a));
-                }
-                if widgets::secondary_button(ui, tl!("Restore All"), 110.0).clicked() {
-                    d.restore_all();
-                }
-            });
-            widgets::hairline(ui);
-            widgets::section_label(ui, tl!("Mask Options"));
-            ui.horizontal(|ui| {
-                if widgets::secondary_button(ui, tl!("None"), 70.0).clicked() {
-                    d.global(LiquifyTool::ThawAll, None);
-                }
-                if widgets::secondary_button(ui, tl!("Mask All"), 80.0).clicked() {
-                    d.global(LiquifyTool::FreezeAll, None);
-                }
-                if widgets::secondary_button(ui, tl!("Invert All"), 80.0).clicked() {
-                    d.global(LiquifyTool::InvertFreeze, None);
-                }
-            });
-            widgets::hairline(ui);
-            widgets::section_label(ui, tl!("View Options"));
-            widgets::checkbox(ui, &mut d.opts.show_mesh, tl!("Show Mesh"));
-            ui.horizontal(|ui| {
-                ui.label(tl!("Mesh Size"));
-                widgets::dropdown(ui, "liquify-mesh-size", &mut d.opts.mesh_size, &[(0, tl!("Small")), (1, tl!("Medium")), (2, tl!("Large"))], 110.0);
-            });
-            widgets::checkbox(ui, &mut d.opts.show_mask, tl!("Show Mask"));
-            d.detail.panel(ui, &mut d.opts.view, d.proxy.scale, &mut d.opts.show_backdrop, &mut d.opts.backdrop_opacity);
-            ui.add_enabled_ui(!d.opts.view.before, |ui| manual_rig::panel(d, ui));
-            widgets::hairline(ui);
-            ui.label(
-                egui::RichText::new(format!("{} stroke(s) · field {} px/node · dab {:.2} ms", d.strokes.len(), d.cell, d.dab_ms))
-                    .color(t.text_faint)
-                    .size(11.0),
-            );
-        });
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!d.strokes.is_empty() || d.cur.is_some(), egui::Button::new(tl!("Undo"))).clicked() {
+                        d.undo();
+                    }
+                    if ui.add_enabled(!d.redo.is_empty(), egui::Button::new(tl!("Redo"))).clicked() {
+                        d.redo();
+                    }
+                });
+                face_ui::panel(d, ui);
+                widgets::hairline(ui);
+                egui::CollapsingHeader::new("Brush tools and advanced options").id_salt("liquify-advanced").show(ui, |ui| {
+                    if widgets::secondary_button(ui, tl!("Precision Push preset"), 230.0).clicked() {
+                        d.end();
+                        d.rig.enabled = false;
+                        d.opts.tool = LiquifyTool::PrecisionWarp;
+                        d.preview_tool = PreviewTool::Brush;
+                        d.face.enabled = false;
+                        d.opts.density = 65.0;
+                        d.opts.pressure = 35.0;
+                    }
+                    widgets::section_label(ui, tl!("Brush Tool Options"));
+                    widgets::slider_row(ui, tl!("Size"), &mut d.opts.size, 1.0..=3000.0, "", None);
+                    widgets::slider_row(ui, tl!("Density"), &mut d.opts.density, 0.0..=100.0, "", None);
+                    widgets::slider_row(ui, tl!("Pressure"), &mut d.opts.pressure, 0.0..=100.0, "", None);
+                    widgets::slider_row(ui, tl!("Rate"), &mut d.opts.rate, 0.0..=100.0, "", None);
+                    widgets::hairline(ui);
+                    widgets::section_label(ui, tl!("Brush Reconstruct Options"));
+                    widgets::slider_row(ui, tl!("Amount"), &mut d.opts.reconstruct_amount, 0.0..=100.0, "%", None);
+                    ui.horizontal(|ui| {
+                        if widgets::secondary_button(ui, tl!("Reconstruct"), 110.0).clicked() {
+                            let a = f64::from(d.opts.reconstruct_amount);
+                            d.global(LiquifyTool::ReconstructAll, Some(a));
+                        }
+                        if widgets::secondary_button(ui, tl!("Restore All"), 110.0).clicked() {
+                            d.restore_all();
+                        }
+                    });
+                    widgets::hairline(ui);
+                    widgets::section_label(ui, tl!("Mask Options"));
+                    ui.horizontal(|ui| {
+                        if widgets::secondary_button(ui, tl!("None"), 70.0).clicked() {
+                            d.global(LiquifyTool::ThawAll, None);
+                        }
+                        if widgets::secondary_button(ui, tl!("Mask All"), 80.0).clicked() {
+                            d.global(LiquifyTool::FreezeAll, None);
+                        }
+                        if widgets::secondary_button(ui, tl!("Invert All"), 80.0).clicked() {
+                            d.global(LiquifyTool::InvertFreeze, None);
+                        }
+                    });
+                    widgets::hairline(ui);
+                    widgets::section_label(ui, tl!("View Options"));
+                    widgets::checkbox(ui, &mut d.opts.show_mesh, tl!("Show Mesh"));
+                    ui.horizontal(|ui| {
+                        ui.label(tl!("Mesh Size"));
+                        widgets::dropdown(ui, "liquify-mesh-size", &mut d.opts.mesh_size, &[(0, tl!("Small")), (1, tl!("Medium")), (2, tl!("Large"))], 110.0);
+                    });
+                    widgets::checkbox(ui, &mut d.opts.show_mask, tl!("Show Mask"));
+                    d.detail.panel(ui, &mut d.opts.view, d.proxy.scale, &mut d.opts.show_backdrop, &mut d.opts.backdrop_opacity);
+                    egui::CollapsingHeader::new("Manual outline placement").show(ui, |ui| {
+                        ui.add_enabled_ui(!d.opts.view.before, |ui| manual_rig::panel(d, ui));
+                    });
+                    widgets::hairline(ui);
+                    ui.label(
+                        egui::RichText::new(format!("{} stroke(s) · field {} px/node · dab {:.2} ms", d.strokes.len(), d.cell, d.dab_ms))
+                            .color(t.text_faint)
+                            .size(11.0),
+                    );
+                });
+            },
+        );
         // Footer buttons.
         let foot = ERect::from_min_size(pos2(right.left() + 14.0, right.bottom() - 48.0), vec2(RIGHT_W - 28.0, 32.0));
         let mut fb = ui.new_child(egui::UiBuilder::new().max_rect(foot).layout(egui::Layout::right_to_left(egui::Align::Center)));
         if let Some(role) = widgets::dialog_buttons(
             &mut fb,
             &[
-                widgets::DialogButton::new(widgets::ButtonRole::Default, tl!("OK"), 84.0),
+                widgets::DialogButton::new(widgets::ButtonRole::Default, tl!("Apply"), 84.0),
                 widgets::DialogButton::new(widgets::ButtonRole::Cancel, tl!("Cancel"), 84.0),
             ],
         ) {
             action = Some(if role == widgets::ButtonRole::Default { "ok" } else { "cancel" });
         }
         // Preview.
-        let area = ERect::from_min_max(pos2(left.right(), body.top()), pos2(right.left(), body.bottom()));
+        let area = ERect::from_min_max(pos2(left.right(), body.top()), pos2(right.left(), body.bottom() - 34.0));
         painter.rect_filled(area, 0.0, t.canvas);
         let (cw, ch) = (d.canvas.width() as f32, d.canvas.height() as f32);
-        if d.zoom <= 0.0 {
-            d.zoom = ((area.width() - 40.0) / cw).min((area.height() - 40.0) / ch).clamp(0.01, 4.0);
+        if d.zoom_fit || d.zoom <= 0.0 {
+            d.zoom = ((area.width() - 40.0) / cw).min((area.height() - 40.0) / ch).clamp(0.01 / d.pixels_per_point, 32.0 / d.pixels_per_point);
             d.center = [f64::from(d.canvas.x0) + f64::from(cw) / 2.0, f64::from(d.canvas.y0) + f64::from(ch) / 2.0];
         }
         let resp = ui.interact(area, egui::Id::new("liquify-preview"), Sense::click_and_drag());
-        // Wheel zooms about the pointer.
-        if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0
+        // Handle wheel, Windows Ctrl+wheel, and pinch, preserving the point under the pointer.
+        if resp.hovered() && d.cur.is_none() && !d.rig.pointer_captured() {
+            let factor = preview_zoom_factor(ctx);
+            if factor != 1.0
                 && let Some(hp) = resp.hover_pos()
             {
-                let before = to_doc(d, area, hp);
-                // Liquify's own preview zoom, not the canvas (`zoom_levels` doesn't apply): the
-                // preview is a proxy of at most PROXY_SIDE px, so past 3200 % it would only magnify
-                // proxy pixels further.
-                d.zoom = (d.zoom * (scroll / 200.0).exp()).clamp(0.01, 32.0);
-                let after = to_doc(d, area, hp);
-                d.center = [d.center[0] + before[0] - after[0], d.center[1] + before[1] - after[1]];
+                zoom_at(d, area, hp, d.zoom * factor);
             }
         }
+        if d.preview_tool == PreviewTool::Zoom && resp.clicked() {
+            let factor = if ui.input(|i| i.modifiers.alt) { 0.5 } else { 2.0 };
+            if let Some(hp) = resp.interact_pointer_pos() {
+                zoom_at(d, area, hp, d.zoom * factor);
+            }
+        }
+        let viewbar = ERect::from_min_max(pos2(left.right(), area.bottom()), pos2(right.left(), body.bottom()));
+        painter.rect_filled(viewbar, 0.0, t.dock);
+        let mut view_ui =
+            ui.new_child(egui::UiBuilder::new().max_rect(viewbar.shrink2(vec2(8.0, 3.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        if view_ui.button("-").on_hover_text("Zoom out").clicked() {
+            zoom_at(d, area, area.center(), d.zoom / 1.25);
+        }
+        let mut percent = d.zoom * d.pixels_per_point * 100.0;
+        if view_ui.add(egui::DragValue::new(&mut percent).range(1.0..=3200.0).suffix("%").speed(1.0)).changed() {
+            zoom_at(d, area, area.center(), percent / (100.0 * d.pixels_per_point));
+        }
+        if view_ui.button("+").on_hover_text("Zoom in").clicked() {
+            zoom_at(d, area, area.center(), d.zoom * 1.25);
+        }
+        if view_ui.button("Fit").clicked() {
+            d.zoom_fit = true;
+        }
+        if view_ui.button("100%").on_hover_text("Actual image pixels").clicked() {
+            zoom_at(d, area, area.center(), 1.0 / d.pixels_per_point);
+        }
+        view_ui.label("Wheel: zoom | Space-drag: pan");
         let img = ERect::from_min_max(
             to_screen(d, area, [f64::from(d.canvas.x0), f64::from(d.canvas.y0)]),
             to_screen(d, area, [f64::from(d.canvas.x1), f64::from(d.canvas.y1)]),
@@ -902,6 +1158,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             draw_mesh(d, &clip, area);
         }
         manual_rig::draw(d, &clip, area);
+        face_ui::draw(d, &clip, area);
         // The lasso polygon being drawn (danger colour freezes, accent thaws; the mask overlay paints the
         // applied area red like the Freeze brush).
         if let Some((subtract, pts)) = &d.lasso
@@ -913,7 +1170,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         // Brush outline (the lasso has none).
         if let Some(hp) = resp.hover_pos() {
-            if d.opts.tool != LiquifyTool::LassoMask {
+            if d.preview_tool == PreviewTool::Brush && !d.face.enabled && d.opts.tool != LiquifyTool::LassoMask {
                 let r = d.opts.size * 0.5 * d.zoom;
                 clip.circle_stroke(hp, r, Stroke::new(1.5, Color32::BLACK));
                 clip.circle_stroke(hp, r, Stroke::new(0.75, Color32::WHITE));
@@ -922,11 +1179,19 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         }
         clip.rect_stroke(img, 0.0, Stroke::new(1.0, t.separator), egui::StrokeKind::Outside);
         // Mouse → strokes (Space or middle button pans).
-        let pan = ui.input(|i| i.key_down(egui::Key::Space) || i.pointer.middle_down());
+        let pan = d.preview_tool == PreviewTool::Hand || ui.input(|i| i.key_down(egui::Key::Space) || i.pointer.middle_down());
+        if pan {
+            resp.clone().on_hover_cursor(egui::CursorIcon::Grab);
+        } else if d.preview_tool == PreviewTool::Zoom {
+            resp.clone().on_hover_cursor(egui::CursorIcon::ZoomIn);
+        }
         if pan && resp.dragged() {
             let dl = resp.drag_delta();
             d.center = [d.center[0] - f64::from(dl.x / d.zoom), d.center[1] - f64::from(dl.y / d.zoom)];
-        } else if !d.opts.view.before
+        } else if !pan
+            && !d.face.enabled
+            && d.preview_tool == PreviewTool::Brush
+            && !d.opts.view.before
             && let Some(pp) = resp.interact_pointer_pos()
         {
             let q = to_doc(d, area, pp);

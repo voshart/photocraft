@@ -106,6 +106,10 @@ impl RigWarp {
     }
 
     pub fn validate_grid(&self, canvas: Rect, cell: f64) -> Result<(), String> {
+        self.validate_grid_with_budget(canvas, cell, MAX_EDIT_NODES)
+    }
+
+    pub(super) fn validate_grid_with_budget(&self, canvas: Rect, cell: f64, node_budget: u64) -> Result<(), String> {
         self.validate()?;
         if !cell.is_finite() || !(1.0..=64.0).contains(&cell) {
             return Err("Invalid field spacing".into());
@@ -113,8 +117,9 @@ impl RigWarp {
         let area = self.rect().intersect(&canvas);
         let w = (f64::from(area.width()) / cell).ceil() as u64 + 4;
         let h = (f64::from(area.height()) / cell).ceil() as u64 + 4;
-        if w.saturating_mul(h) > MAX_EDIT_NODES {
-            return Err("Rig region exceeds the 500000-node interaction budget; use a smaller region".into());
+        let budget = node_budget.min(4_000_000);
+        if w.saturating_mul(h) > budget {
+            return Err(format!("Region exceeds the {budget}-node interaction budget; use a smaller image"));
         }
         Ok(())
     }
@@ -290,7 +295,11 @@ pub fn prepare_steps(rig: &RigWarp) -> Result<Vec<Prepared>, String> {
 /// Apply to geometry only. All reads use the unchanged incoming field. Writes
 /// are staged locally; a preparation/validation failure leaves it untouched.
 pub fn apply(field: &mut LiquifyField, rig: &RigWarp) -> Result<Rect, String> {
-    rig.validate_grid(field.bounds, field.cell)?;
+    apply_with_budget(field, rig, MAX_EDIT_NODES)
+}
+
+pub(super) fn apply_with_budget(field: &mut LiquifyField, rig: &RigWarp, node_budget: u64) -> Result<Rect, String> {
+    rig.validate_grid_with_budget(field.bounds, field.cell, node_budget)?;
     if field.w < 2 || field.h < 2 || field.w.checked_mul(field.h) != Some(field.d.len()) || field.freeze.len() != field.d.len() {
         return Err("Inconsistent displacement field storage".into());
     }
@@ -307,8 +316,8 @@ pub fn apply(field: &mut LiquifyField, rig: &RigWarp) -> Result<Rect, String> {
     let j0 = index(area.y0, field.bounds.y0).floor().max(0.0) as usize;
     let i1 = (index(area.x1, field.bounds.x0).ceil() as usize + 1).min(field.w);
     let j1 = (index(area.y1, field.bounds.y0).ceil() as usize + 1).min(field.h);
-    let mut writes = Vec::new();
-    for j in j0..j1 {
+    let row = |j| -> Result<Vec<(usize, [f32; 2])>, String> {
+        let mut writes = Vec::new();
         for i in i0..i1 {
             let p = field.node_pos(i, j);
             let idx = j * field.w + i;
@@ -336,13 +345,23 @@ pub fn apply(field: &mut LiquifyField, rig: &RigWarp) -> Result<Rect, String> {
                 writes.push((idx, value));
             }
         }
-    }
-    if writes.is_empty() {
+        Ok(writes)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let rows: Vec<_> = {
+        use rayon::prelude::*;
+        (j0..j1).into_par_iter().map(row).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let rows: Vec<_> = (j0..j1).map(row).collect();
+    // All rows validate before any field mutation, preserving transactional replay.
+    let rows: Vec<_> = rows.into_iter().collect::<Result<_, _>>()?;
+    if rows.iter().all(Vec::is_empty) {
         return Ok(Rect::EMPTY);
     }
-    for (i, d) in writes {
+    for (i, value) in rows.into_iter().flatten() {
         if let Some(slot) = field.d.get_mut(i) {
-            *slot = d;
+            *slot = value;
         }
     }
     // Include interpolation influence beyond the node footprint.

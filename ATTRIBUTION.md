@@ -8,6 +8,13 @@ next to them.
 
 ## Bundled in the app
 
+The personal Windows setup downloads these assets beside the executable (the binaries are not committed):
+
+| Path | Title | Author | Source | License |
+|---|---|---|---|---|
+| `dist/windows/models/face_landmarker.task` | Face Landmarker float16 v1 | Google / MediaPipe authors | [Official model](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task), [Face Mesh V2 model card](https://storage.googleapis.com/mediapipe-assets/Model%20Card%20MediaPipe%20Face%20Mesh%20V2.pdf) | Apache-2.0; setup copies `LICENSE-APACHE.txt` alongside it |
+| `%LOCALAPPDATA%/mediapipe-rs/0.10.35/libmediapipe.dll` | MediaPipe Tasks 0.10.35 Windows x64 runtime | Google / MediaPipe authors | Official PyPI wheel, pinned URL and SHA-256 in `scripts/setup-face-model.ps1` | Apache-2.0; setup copies `LICENSE-APACHE.txt` alongside it |
+
 | Path | Title | Author | Source | License |
 |---|---|---|---|---|
 | `crates/ui-egui/src/i18n/el.tsv` | Greek UI translations | PhotoCraft contributors | Original translations of PhotoCraft's English labels | MIT OR Apache-2.0, [`LICENSE-translations.txt`](crates/ui-egui/src/i18n/LICENSE-translations.txt) |

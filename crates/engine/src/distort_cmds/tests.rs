@@ -1,5 +1,36 @@
 use super::*;
 
+#[test]
+fn liquify_face_sliders_commit_and_undo_at_every_depth_and_reject_invalid_payloads() {
+    use photocraft_algo::liquify::{
+        face::{FaceSliders, FaceWarp},
+        rig::{RegionKind, RigWarp},
+    };
+    let regions = [
+        RigWarp::new(RegionKind::Eye, [0., 0., 40., 40.]).unwrap(),
+        RigWarp::new(RegionKind::Eye, [40., 0., 80., 40.]).unwrap(),
+        RigWarp::new(RegionKind::Mouth, [10., 20., 70., 60.]).unwrap(),
+        RigWarp::new(RegionKind::Mouth, [20., 10., 60., 50.]).unwrap(),
+        RigWarp::new(RegionKind::Mouth, [0., 0., 80., 60.]).unwrap(),
+    ];
+    let face = FaceWarp { regions, sliders: FaceSliders { eye_size: 40., smile: 30., ..Default::default() } };
+    let params = json!({"strokes":[{"tool":"faceWarpV1","face":face}]});
+    for depth in [8, 16, 32] {
+        let mut s = session(depth);
+        let before = active_surface(&s);
+        s.execute(LIQUIFY, params.clone()).unwrap();
+        assert_ne!(active_surface(&s), before);
+        s.undo();
+        assert_eq!(active_surface(&s), before);
+        let mut invalid = params.clone();
+        invalid["strokes"][0]["face"]["sliders"]["smile"] = json!(101);
+        assert!(s.execute(LIQUIFY, invalid).is_err());
+        assert_eq!(active_surface(&s), before);
+        assert!(s.execute(LIQUIFY, json!({"strokes":[{"tool":"faceWarpV1"}]})).is_err());
+        assert!(s.execute(LIQUIFY, json!({"strokes":[{"tool":"forwardWarp","face":face}]})).is_err());
+    }
+}
+
 /// 80×60 document, a new layer with a patterned 50×30 block at (10, 10).
 fn session(depth: u64) -> Session {
     let mut s = Session::new();

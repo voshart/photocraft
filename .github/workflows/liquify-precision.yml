@@ -44,7 +44,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --jobs 2 -p photocraft-engine --lib distort
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo clippy --locked --jobs 2 -p photocraft-algo -p photocraft-ui-egui -p photocraft-engine --all-targets -- -D warnings
+          cargo test --locked --jobs 2 -p photocraft-ml --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo clippy --locked --jobs 2 -p photocraft-algo -p photocraft-ui-egui -p photocraft-engine -p photocraft-ml --all-targets -- -D warnings
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo xtask layers
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
