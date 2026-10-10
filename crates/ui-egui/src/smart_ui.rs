@@ -88,6 +88,14 @@ pub fn filter_rows(app: &mut PhotocraftApp, ui: &mut egui::Ui, l: &Layer, depth:
 /// `layer.smartFilter.setParams` instead of adding another filter (see `dialogs::confirm`).
 pub fn open_editor(app: &mut PhotocraftApp, ctx: &egui::Context, layer: u64, sm: &SmartObject, index: usize) {
     let Some(f) = sm.smart_filters.get(index) else { return };
+    // Liquify has structured strokes/guides, not a generic slider form.
+    if f.command == "filter.liquify" {
+        if let Err(error) = crate::liquify_ui::open_smart_filter(app, ctx, photocraft_doc::LayerId(layer), index) {
+            app.ui.status = error;
+            app.ui.status_error = true;
+        }
+        return;
+    }
     // Camera Raw has its own full-window dialog rather than a generic parameter form.
     if f.command == photocraft_engine::lens_cmds::RAW {
         if let Err(e) = crate::camera_raw_ui::open_smart_filter(app, ctx, photocraft_doc::LayerId(layer), index) {

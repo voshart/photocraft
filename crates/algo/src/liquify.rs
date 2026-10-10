@@ -23,12 +23,23 @@ use photocraft_geom::Rect;
 use photocraft_raster::Surface;
 use serde::{Deserialize, Serialize};
 
+#[path = "liquify_precision.rs"]
+pub mod precision;
+#[path = "liquify_rig.rs"]
+pub mod rig;
+
 /// The Liquify tools (Photoshop's left tool strip, minus Hand/Zoom/Face).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LiquifyTool {
     #[default]
     ForwardWarp,
+    /// Versioned continuous-shoulder brush; legacy ForwardWarp replay is unchanged.
+    PrecisionWarp,
+    /// Typed manual correspondence warp; not a point-list brush.
+    RigWarpV1,
+    /// Undoable reset of displacement and protection inside this session.
+    ResetSessionV1,
     Reconstruct,
     Smooth,
     TwirlCw,
@@ -48,8 +59,9 @@ pub enum LiquifyTool {
 }
 
 impl LiquifyTool {
-    pub const ALL: [LiquifyTool; 11] = [
+    pub const ALL: [LiquifyTool; 12] = [
         LiquifyTool::ForwardWarp,
+        LiquifyTool::PrecisionWarp,
         LiquifyTool::Reconstruct,
         LiquifyTool::Smooth,
         LiquifyTool::TwirlCw,
@@ -65,6 +77,9 @@ impl LiquifyTool {
     pub fn label(self) -> &'static str {
         match self {
             LiquifyTool::ForwardWarp => "Forward Warp",
+            LiquifyTool::PrecisionWarp => "Precision Push",
+            LiquifyTool::RigWarpV1 => "Manual face rig",
+            LiquifyTool::ResetSessionV1 => "Restore All",
             LiquifyTool::Reconstruct => "Reconstruct",
             LiquifyTool::Smooth => "Smooth",
             LiquifyTool::TwirlCw => "Twirl Clockwise",
@@ -84,12 +99,12 @@ impl LiquifyTool {
 
     /// Whole-field operations (no brush, no points).
     pub fn is_global(self) -> bool {
-        matches!(self, LiquifyTool::ReconstructAll | LiquifyTool::FreezeAll | LiquifyTool::ThawAll | LiquifyTool::InvertFreeze)
+        matches!(self, LiquifyTool::ReconstructAll | LiquifyTool::FreezeAll | LiquifyTool::ThawAll | LiquifyTool::InvertFreeze | LiquifyTool::ResetSessionV1)
     }
 
     /// Tools that act while the brush is held still (each recorded point is a dab).
     pub fn is_stationary(self) -> bool {
-        !matches!(self, LiquifyTool::ForwardWarp | LiquifyTool::PushLeft | LiquifyTool::LassoMask)
+        !matches!(self, LiquifyTool::ForwardWarp | LiquifyTool::PrecisionWarp | LiquifyTool::RigWarpV1 | LiquifyTool::PushLeft | LiquifyTool::LassoMask)
     }
 }
 
@@ -131,15 +146,29 @@ pub struct LiquifyStroke {
     /// polygon, 0.0 thaws it.
     #[serde(default)]
     pub amount: Option<f64>,
+    /// Present only for RigWarpV1; no change to legacy brush payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig: Option<rig::RigWarp>,
 }
 
 impl LiquifyStroke {
     pub fn new(tool: LiquifyTool, size: f64) -> Self {
-        LiquifyStroke { tool, size, density: d_density(), pressure: d_pressure(), rate: d_rate(), points: Vec::new(), amount: None }
+        LiquifyStroke { tool, size, density: d_density(), pressure: d_pressure(), rate: d_rate(), points: Vec::new(), amount: None, rig: None }
     }
 
     /// Validates the stroke (finite numbers, 2 or 3 per point).
     pub fn validate(&self) -> Result<(), String> {
+        if self.tool == LiquifyTool::RigWarpV1 {
+            let r = self.rig.as_ref().ok_or("rigWarpV1 needs a rig payload")?;
+            rig::prepare_steps(r)?;
+            if !self.points.is_empty() {
+                return Err("rigWarpV1 does not accept brush points".into());
+            }
+            return Ok(());
+        }
+        if self.rig.is_some() {
+            return Err("Only rigWarpV1 accepts a rig payload".into());
+        }
         if !(self.size.is_finite() && self.size >= 1.0 && self.size <= 15000.0) {
             return Err(format!("brush size {} out of range 1..15000", self.size));
         }
@@ -220,6 +249,16 @@ impl LiquifyField {
     /// Applies one stroke. Returns the document rectangle whose output changed.
     pub fn apply_stroke(&mut self, s: &LiquifyStroke) -> Rect {
         match s.tool {
+            LiquifyTool::RigWarpV1 => {
+                // Engine/UI entry points validate before dispatch. Lower-level replay
+                // remains total for corrupt or unsupported standalone stroke data.
+                return s.rig.as_ref().and_then(|r| rig::apply(self, r).ok()).unwrap_or(Rect::EMPTY);
+            }
+            LiquifyTool::ResetSessionV1 => {
+                self.d.fill([0.0; 2]);
+                self.freeze.fill(0.0);
+                return self.bounds;
+            }
             LiquifyTool::LassoMask => return self.apply_lasso(s),
             LiquifyTool::ReconstructAll => {
                 let k = (s.amount.unwrap_or(100.0) / 100.0).clamp(0.0, 1.0) as f32;
@@ -371,7 +410,7 @@ impl LiquifyField {
 
     /// One dab at `c` with brush motion `delta`. Returns the document rect it affected.
     fn dab(&mut self, s: &LiquifyStroke, c: [f64; 2], delta: [f64; 2], point_pressure: f64) -> Rect {
-        if s.tool == LiquifyTool::LassoMask {
+        if matches!(s.tool, LiquifyTool::LassoMask | LiquifyTool::RigWarpV1 | LiquifyTool::ResetSessionV1) {
             return Rect::EMPTY; // the lasso is polygon-only; never a brush dab
         }
         let r = (s.size / 2.0).max(0.5);
@@ -421,7 +460,7 @@ impl LiquifyField {
                     continue;
                 }
                 let soft = (1.0 - t2) * (1.0 - t2);
-                let fall = (1.0 - density) + density * soft;
+                let fall = if s.tool == LiquifyTool::PrecisionWarp { precision::smooth_falloff(t2.sqrt(), density) } else { (1.0 - density) + density * soft };
                 let idx = j * self.w + i;
                 let k_raw = strength * fall;
                 if s.tool == LiquifyTool::Freeze || s.tool == LiquifyTool::Thaw {
@@ -454,7 +493,7 @@ impl LiquifyField {
                     }
                     _ => {
                         let q = match s.tool {
-                            LiquifyTool::ForwardWarp => [p[0] - k * delta[0], p[1] - k * delta[1]],
+                            LiquifyTool::ForwardWarp | LiquifyTool::PrecisionWarp => [p[0] - k * delta[0], p[1] - k * delta[1]],
                             // Left of the stroke direction (y down): (dx, dy) → (dy, -dx).
                             LiquifyTool::PushLeft => [p[0] - k * delta[1], p[1] + k * delta[0]],
                             LiquifyTool::TwirlCw | LiquifyTool::TwirlCcw => {
@@ -552,6 +591,17 @@ fn catmull_rom(t: f64) -> [f64; 4] {
 /// `p + d(p)` (bicubic field, bicubic premultiplied source, edge pixels repeat past the field
 /// bounds); everything outside the bounds is kept. Same format as `src`.
 pub fn apply_liquify(src: &Surface, field: &LiquifyField) -> Surface {
+    apply_liquify_region(src, field, field.bounds)
+}
+
+/// Uses the final renderer, but writes only `requested`. Whole intersecting tiles
+/// are evaluated so source-footprint edge handling is identical to a full Apply.
+/// Source pixels elsewhere are retained via the copy-on-write surface.
+pub fn apply_liquify_region(src: &Surface, field: &LiquifyField, requested: Rect) -> Surface {
+    let area = requested.intersect(&field.bounds);
+    if area.is_empty() {
+        return src.clone();
+    }
     let fmt = src.format();
     let n = fmt.channels();
     let alpha = fmt.alpha;
@@ -561,7 +611,7 @@ pub fn apply_liquify(src: &Surface, field: &LiquifyField) -> Surface {
         return out;
     }
     let maxd = f64::from(field.max_displacement()).ceil() as i32 + 3;
-    let tiles: Vec<Rect> = b.tiles().map(|t| t.rect().intersect(&b)).filter(|r| !r.is_empty() && field.touches(*r)).collect();
+    let tiles: Vec<Rect> = area.tiles().map(|t| t.rect().intersect(&b)).filter(|r| !r.is_empty() && field.touches(*r)).collect();
     let work = |t: &Rect| -> Option<(Rect, Vec<f32>)> {
         let w = t.width() as usize;
         let h = t.height() as usize;
@@ -659,7 +709,7 @@ pub fn apply_liquify(src: &Surface, field: &LiquifyField) -> Surface {
     #[cfg(target_arch = "wasm32")]
     let done: Vec<(Rect, Vec<f32>)> = tiles.iter().filter_map(work).collect();
     for (r, v) in done {
-        out.write_region(r, &v);
+        precision::write_requested_tile(&mut out, r, area, &v);
     }
     if alpha {
         out.prune();
